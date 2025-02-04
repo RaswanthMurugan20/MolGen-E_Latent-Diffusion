@@ -9,14 +9,16 @@ import torch
 import CONSTANTS
 from diffusion.text_denoising_diffusion import GaussianDiffusion, Trainer
 from model.diffusion_transformer import DiffusionTransformer
+import os
 
 ATTN_HEAD_DIM=64
 
 def get_diffusion_latent_dims(args):
-    if args.latent_model_path is None:
+    if args.latent_model_path is None: # 1. add the path of the latentdiff
         config = AutoConfig.from_pretrained(args.enc_dec_model)
-        latent_dim = config.d_model
+        latent_dim = 64
         lm_dim = config.d_model
+        # config.d_model
     else:
         with open(os.path.join(args.latent_model_path, 'args.json'), 'rt') as f:
             latent_model_args = json.load(f)
@@ -40,17 +42,22 @@ def main(args):
         tx_depth = args.tx_depth,
         heads = args.tx_dim//ATTN_HEAD_DIM,
         latent_dim = latent_dim,
-        max_seq_len = args.max_seq_len,
+        max_seq_len = args.max_seq_len, # change the max_len basd on data
         self_condition = args.self_condition,
         scale_shift = args.scale_shift,
         dropout = 0 if args.disable_dropout else 0.1,
-        class_conditional= args.class_conditional,
-        num_classes= (CONSTANTS.NUM_CLASSES[args.dataset_name] if args.class_conditional else 0),
+        class_conditional = args.class_conditional, # set this to false is there is no classes in dataset
+        vec_conditional = args.vector_conditional, # vector conditional switch
+        condition_dim=args.condition_dim, # dimension of conditional dim
+        dataset_name= args.dataset_name,
         class_unconditional_prob= args.class_unconditional_prob,
-        seq2seq=(args.dataset_name in {'xsum', 'qqp', 'qg', 'wmt14-de-en', 'wmt14-en-de'}),
+        vec_unconditional_prob= args.class_unconditional_prob,
+        seq2seq = True,
         seq2seq_context_dim=lm_dim, 
         num_dense_connections=args.num_dense_connections,
     ).cuda()
+
+    # Diffusion Transformer vector conditioning done
 
     args.trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -67,6 +74,8 @@ def main(args):
         seq2seq_unconditional_prob = args.seq2seq_unconditional_prob,
         scale = args.scale,
     ).cuda()
+
+    # it seems there is not much changes needed here 
 
     trainer = Trainer(
         args=args,
@@ -89,6 +98,8 @@ def main(args):
         results_folder = args.output_dir,
         amp = args.amp,
         mixed_precision = args.mixed_precision,
+        task = args.task,
+        fingerprint = args.fingerprint,
     )
 
     if args.eval:
@@ -120,21 +131,27 @@ def main(args):
     if args.init_path:
         trainer.load(args.init_path, init_only=True)
 
-    trainer.train()
+    if args.task == "dpo_training":
+        trainer.dpo_train(args.beta)
+    else:
+        trainer.train()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Training arguments")
-    parser.add_argument("--dataset_name", type=str, default=None)
+    parser.add_argument("--dataset_name", type=str, default="HUBioDataLab/SELFormer-selfies")
     parser.add_argument("--save_dir", type=str, default="saved_diff_models")
+    parser.add_argument("--fingerprint",type=str, default="maccs")
+    parser.add_argument("--mode",type=str,default="phenotype")
     parser.add_argument("--output_dir", type=str, default=None)
-    parser.add_argument("--wandb_name", type=str, default=None)
+    parser.add_argument("--wandb_name", type=str, default="roc_latent_v")
+    parser.add_argument("--beta",type=float,default=5000)
     # Optimization hyperparameters
     parser.add_argument("--optimizer", type=str, default="adamw")
-    parser.add_argument("--train_batch_size", type=int, default=16)
+    parser.add_argument("--train_batch_size", type=int, default=32)
     parser.add_argument("--eval_batch_size", type=int, default=32)
-    parser.add_argument("--num_train_steps", type=int, default=60000)
+    parser.add_argument("--num_train_steps", type=int, default=2000)#65000
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--clip_grad_norm", type=float, default=1.0)
     parser.add_argument("--lr_schedule", type=str, default="cosine")
     parser.add_argument("--lr_warmup_steps", type=int, default=1000)
@@ -143,11 +160,12 @@ if __name__ == "__main__":
     parser.add_argument("--adam_weight_decay", type=float, default=1e-6)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--ema_update_every", type=int, default=1)
+    parser.add_argument("--gene_drug_mode",action="store_true",default=True)
     # Diffusion Hyperparameters
     parser.add_argument(
         "--objective",
         type=str,
-        default="pred_noise",
+        default="pred_x0",
         choices=["pred_noise", "pred_x0", "pred_v",],
         help=(
             "Which parameterization to use for the diffusion objective."
@@ -182,34 +200,36 @@ if __name__ == "__main__":
     )
 
     parser.add_argument("--scale", type=float, default=1.0)
-    parser.add_argument("--sampling_timesteps", type=int, default=250)
+    parser.add_argument("--sampling_timesteps", type=int, default=80)
     parser.add_argument("--normalize_latent", action="store_true", default=False)
     # Generation Arguments
-    parser.add_argument("--save_and_sample_every", type=int, default=5000)
-    parser.add_argument("--num_samples", type=int, default=16)
+    parser.add_argument("--save_and_sample_every", type=int, default=1000)
+    parser.add_argument("--num_samples", type=int, default=100) #100
     parser.add_argument("--seq2seq_candidates", type=int, default=5)
-    parser.add_argument("--max_seq_len", type=int, default=64)
-    parser.add_argument("--self_condition", action="store_true", default=False)
+    parser.add_argument("--max_seq_len", type=int, default=1024)
+    parser.add_argument("--self_condition", action="store_true", default=True)
     parser.add_argument("--train_prob_self_cond", type=float, default=0.5)
+    parser.add_argument("--use_my_latent_model", action="store_true",default=True)
     parser.add_argument(
         "--sampler",
         type=str,
-        default='ddpm',
+        default='ddim',
         choices=["ddpm", "ddim", "dpmpp"],
         help=(
             "Which noise schedule to use."
         ),
     )
     # Model hyperparemeters
-    parser.add_argument("--enc_dec_model", type=str, default="facebook/bart-base")
+    parser.add_argument("--enc_dec_model", type=str, default="zjunlp/MolGen-large")
     parser.add_argument("--tx_dim", type=int, default=512)
-    parser.add_argument("--tx_depth", type=int, default=6)
-    parser.add_argument("--scale_shift", action="store_true", default=False)
-    parser.add_argument("--num_dense_connections", type=int, default=0)
+    parser.add_argument("--tx_depth", type=int, default=12)
+    parser.add_argument("--scale_shift", action="store_true", default=True)
+    parser.add_argument("--num_dense_connections", type=int, default=3)
     parser.add_argument("--disable_dropout", action="store_true", default=False)
     parser.add_argument("--class_conditional", action="store_true", default=False)
+    
     parser.add_argument("--class_unconditional_prob", type=float, default=.1)
-    parser.add_argument("--seq2seq_unconditional_prob", type=float, default=0.1)
+    parser.add_argument("--seq2seq_unconditional_prob", type=float, default=1)
     # Accelerate arguments
     parser.add_argument("--amp", action="store_true", default=False)
     parser.add_argument(
@@ -228,13 +248,18 @@ if __name__ == "__main__":
     parser.add_argument("--eval_test", action="store_true", default=False)
     parser.add_argument("--resume_training", action="store_true", default=False)
     parser.add_argument("--resume_dir", type=str, default=None)
-    parser.add_argument("--latent_model_path", type=str, default=None)
+    parser.add_argument("--latent_model_path", type=str, default="saved_latent_models/SELFormer-selfies/2024-07-16_01-53-07/")
     parser.add_argument("--init_path", type=str, default=None)
-    
+    parser.add_argument("--vector_conditional", action="store_true", default=True)
+    parser.add_argument("--condition_dim",type=int, default=4)
+    # parser.add_argument("--condition_dim",type=int, default=2518)
+    parser.add_argument("--task",type=str, default="multi-objective")
+
     args = parser.parse_args()
     assert not (args.eval and args.resume_training)
     if args.eval or args.resume_training:
         assert args.resume_dir is not None
+        # 17357 | 11588
 
     if args.eval or args.resume_training or args.eval_test:
         with open(os.path.join(args.resume_dir, 'args.json'), 'rt') as f:

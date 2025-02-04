@@ -14,11 +14,17 @@ import argparse
 from collections import defaultdict
 from contextlib import nullcontext
 from datetime import timedelta
+from datasets import load_dataset
+import datasets
+import pandas as pd
+import selfies as sf
+import seaborn as sns
 
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
+from torch.distributions.beta import Beta
 
 from torch.optim import AdamW
 
@@ -29,24 +35,30 @@ from PIL import Image
 from tqdm.auto import tqdm
 from ema_pytorch import EMA
 
+import selfies as sf
+from rdkit import Chem,DataStructs
+
 from transformers import get_scheduler, AutoTokenizer, PreTrainedTokenizerBase, T5ForConditionalGeneration, MT5ForConditionalGeneration
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.models.bart.modeling_bart import BartForConditionalGeneration
+from rdkit.Chem import AllChem, MACCSkeys
 
 from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
 import wandb
 from latent_models.bart_latent_model import BARTForConditionalGenerationLatent
 from latent_models.t5_latent_model import T5ForConditionalGenerationLatent
-
+from latent_models.my_latent_model import Compression_Net, Reconstruction_Net
 import diffusion.constant as constant
 import diffusion.optimizer as optimizer
 import dataset_utils.text_dataset as text_dataset
+from dataset_utils.chem_dataset import Phenotype, Phenotype_CLIP, MultiObjective, DPO
 from utils.torch_utils import compute_grad_norm
 import utils.file_utils as file_utils
 from latent_models.latent_utils import get_latent_model
-from evaluation import evaluation
-
-
+from evaluation import evaluation, chem_evaluation
+import sys
+import matplotlib.pyplot as plt
+from tdc import Oracle
 
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start', 'pred_v'])
 
@@ -146,6 +158,26 @@ def set_seeds(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
+def objective_sampling(vec_cond):
+    scores_tensor = vec_cond.reshape(-1,vec_cond.shape[-1])  # Random data for demonstration, replace with actual data
+
+    # Function to estimate Beta distribution parameters from data
+    def estimate_beta_parameters(scores):
+        mean = scores.mean(dim=0)
+        variance = scores.var(dim=0)
+        tmp = mean * (1 - mean) / variance - 1
+        alpha = mean * tmp
+        beta = (1 - mean) * tmp
+        return alpha, beta
+
+    # Estimate parameters for each of the 7 scores
+    alphas, betas = estimate_beta_parameters(scores_tensor)
+
+    # Create Beta distributions for each score
+    beta_distributions = [Beta(a, b) for a, b in zip(alphas, betas)]
+    return beta_distributions
+
+
 class GaussianDiffusion(nn.Module):
     def __init__(
         self,
@@ -170,6 +202,10 @@ class GaussianDiffusion(nn.Module):
         if self.diffusion_model.class_conditional:
             if self.diffusion_model.class_unconditional_prob > 0:
                 self.class_unconditional_bernoulli = torch.distributions.Bernoulli(probs=self.diffusion_model.class_unconditional_prob)
+
+        if self.diffusion_model.vec_conditional:
+            if self.diffusion_model.vec_unconditional_prob > 0:
+                self.class_unconditional_bernoulli = torch.distributions.Bernoulli(probs=self.diffusion_model.vec_unconditional_prob)
 
         self.latent_dim = self.diffusion_model.latent_dim
         self.self_condition = self.diffusion_model.self_condition
@@ -284,17 +320,68 @@ class GaussianDiffusion(nn.Module):
         
         return x_start*(self.latent_scale.clamp(min=eps))+self.latent_mean
 
-    def diffusion_model_predictions(self, z_t, mask, t, *, x_self_cond = None,  class_id=None, seq2seq_cond=None, seq2seq_mask=None, sampling=False, cls_free_guidance=1.0, l2_normalize=False):
+    def diffusion_model_predictions(self, z_t, mask, t, *, x_self_cond = None, class_id=None, vec_cond=None, seq2seq_cond=None, seq2seq_mask=None, sampling=False, cls_free_guidance=1.0, vec_free_guidance=1.0, l2_normalize=False):
         time_to_alpha = self.sampling_schedule if sampling else self.train_schedule
         time_cond = time_to_alpha(t)
-        model_output = self.diffusion_model(z_t, mask, time_cond, x_self_cond, class_id=class_id, seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask)
+        model_output = self.diffusion_model(z_t, mask, time_cond, x_self_cond, class_id=class_id, vec_cond=vec_cond, seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask)
         if cls_free_guidance!=1.0:
             if exists(class_id):
                 unc_class_id = torch.full_like(class_id, fill_value=self.diffusion_model.num_classes)
             else:
                 unc_class_id = None
-            unc_model_output = self.diffusion_model(z_t, mask, time_cond, x_self_cond, class_id=unc_class_id, seq2seq_cond=None, seq2seq_mask=None)
+            unc_model_output = self.diffusion_model(z_t, mask, time_cond, x_self_cond, class_id=unc_class_id, vec_cond = vec_cond, seq2seq_cond=None, seq2seq_mask=None)
             model_output = model_output*cls_free_guidance + unc_model_output*(1-cls_free_guidance)
+
+        if vec_free_guidance!=1.0:
+            if exists(vec_cond):
+                unc_vec_cond = torch.full_like(vec_cond, fill_value=0)
+            else:
+                unc_vec_cond = None
+            unc_model_output = self.diffusion_model(z_t, mask, time_cond, x_self_cond, class_id=class_id, vec_cond = unc_vec_cond, seq2seq_cond=None, seq2seq_mask=None)
+            model_output = model_output*vec_free_guidance + unc_model_output*(1-vec_free_guidance)
+
+
+        pred_v = None
+        if self.objective == 'pred_noise':
+            pred_noise = model_output
+            x_start = self.predict_start_from_noise(z_t, t, pred_noise, sampling=sampling)
+        elif self.objective =='pred_x0':
+            x_start = model_output
+            pred_noise = self.predict_noise_from_start(z_t, t, x_start, sampling=sampling)
+            pred_v = self.predict_v_from_start_and_eps(z_t, t, x_start, pred_noise, sampling=sampling)
+        elif self.objective == 'pred_v':
+            pred_v = model_output
+            x_start = self.predict_start_from_v(z_t, t, pred_v, sampling=sampling)
+            pred_noise = self.predict_noise_from_v(z_t, t, pred_v, sampling=sampling)
+        else:
+            raise ValueError(f'invalid objective {self.objective}')
+        if l2_normalize:
+            assert sampling
+            x_start = F.normalize(x_start, dim=-1) * math.sqrt(x_start.shape[-1])
+            pred_noise = self.predict_noise_from_start(z_t, t, x_start, sampling=sampling)
+            pred_v = self.predict_v_from_start_and_eps(z_t, t, x_start, pred_noise, sampling=sampling)
+
+        return ModelPrediction(pred_noise, x_start, pred_v)
+    
+    def diffusion_dpo_model_predictions(self, model, z_t, mask, t, *, x_self_cond = None, class_id=None, vec_cond=None, seq2seq_cond=None, seq2seq_mask=None, sampling=False, cls_free_guidance=1.0, vec_free_guidance=1.0, l2_normalize=False):
+        time_to_alpha = self.sampling_schedule if sampling else self.train_schedule
+        time_cond = time_to_alpha(t)
+        model_output = model(z_t, mask, time_cond, x_self_cond, class_id=class_id, vec_cond=vec_cond, seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask)
+        if cls_free_guidance!=1.0:
+            if exists(class_id):
+                unc_class_id = torch.full_like(class_id, fill_value=self.diffusion_model.num_classes)
+            else:
+                unc_class_id = None
+            unc_model_output = model(z_t, mask, time_cond, x_self_cond, class_id=unc_class_id, vec_cond = vec_cond, seq2seq_cond=None, seq2seq_mask=None)
+            model_output = model_output*cls_free_guidance + unc_model_output*(1-cls_free_guidance)
+
+        if vec_free_guidance!=1.0:
+            if exists(vec_cond):
+                unc_vec_cond = torch.full_like(vec_cond, fill_value=0)
+            else:
+                unc_vec_cond = None
+            unc_model_output = model(z_t, mask, time_cond, x_self_cond, class_id=class_id, vec_cond = unc_vec_cond, seq2seq_cond=None, seq2seq_mask=None)
+            model_output = model_output*vec_free_guidance + unc_model_output*(1-vec_free_guidance)
 
         pred_v = None
         if self.objective == 'pred_noise':
@@ -328,7 +415,7 @@ class GaussianDiffusion(nn.Module):
         return times
 
     @torch.no_grad()
-    def ddim_sample(self, shape, lengths, class_id, seq2seq_cond, seq2seq_mask, cls_free_guidance=1.0, l2_normalize=False, invert=False, z_t=None):
+    def ddim_sample(self, shape, lengths, class_id, vec_cond, seq2seq_cond, seq2seq_mask, cls_free_guidance=1.0, vec_free_guidance=1.0, l2_normalize=False, invert=False, z_t=None):
         print('DDIM sampling')
         batch, device = shape[0], next(self.diffusion_model.parameters()).device
 
@@ -350,7 +437,7 @@ class GaussianDiffusion(nn.Module):
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step', total = self.sampling_timesteps):
             # get predicted x0
 
-            model_output = self.diffusion_model_predictions(z_t, mask, time, class_id=class_id, x_self_cond=x_start, seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask, sampling=True, cls_free_guidance=cls_free_guidance, l2_normalize=l2_normalize)
+            model_output = self.diffusion_model_predictions(z_t, mask, time, class_id=class_id, vec_cond=vec_cond, x_self_cond=x_start, seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask, sampling=True, cls_free_guidance=cls_free_guidance, vec_free_guidance=vec_free_guidance,l2_normalize=l2_normalize)
             # get alpha sigma of time and next time
 
             alpha = self.sampling_schedule(time)
@@ -362,7 +449,6 @@ class GaussianDiffusion(nn.Module):
             x_start = model_output.pred_x_start
 
             eps = model_output.pred_noise
-
             
             if (not invert) and time_next[0] <= 0:
                 z_t = x_start
@@ -374,11 +460,12 @@ class GaussianDiffusion(nn.Module):
             # get noise
             
             z_t = x_start * alpha_next.sqrt() + eps * (1-alpha_next).sqrt()
+        # return (x_start, mask)
         return (z_t, mask)
 
 
     @torch.no_grad()
-    def ddpm_sample(self, shape, lengths, class_id, seq2seq_cond, seq2seq_mask, cls_free_guidance=1.0, l2_normalize=False, invert=False, z_t=None):
+    def ddpm_sample(self, shape, lengths, class_id, vec_cond, seq2seq_cond, seq2seq_mask, cls_free_guidance=1.0, vec_free_guidance=1.0, l2_normalize=False, invert=False, z_t=None):
         batch, device = shape[0], next(self.diffusion_model.parameters()).device
 
         time_pairs = self.get_sampling_timesteps(batch, device = device)
@@ -396,8 +483,7 @@ class GaussianDiffusion(nn.Module):
 
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step', total = self.sampling_timesteps):
             # get predicted x0
-
-            model_output = self.diffusion_model_predictions(z_t, mask, time, class_id=class_id, x_self_cond=x_start, seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask, sampling=True, cls_free_guidance=cls_free_guidance, l2_normalize=l2_normalize)
+            model_output = self.diffusion_model_predictions(z_t, mask, time, class_id=class_id, vec_cond=vec_cond, x_self_cond=x_start, seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask, sampling=True, cls_free_guidance=cls_free_guidance, vec_free_guidance=vec_free_guidance,l2_normalize=l2_normalize)
             # get alpha sigma of time and next time
 
             alpha = self.sampling_schedule(time)
@@ -425,7 +511,7 @@ class GaussianDiffusion(nn.Module):
     
 
     @torch.no_grad()
-    def dpmpp_sample(self, shape, lengths, class_id, seq2seq_cond, seq2seq_mask, cls_free_guidance=1.0, l2_normalize=False, invert=False, z_t=None):
+    def dpmpp_sample(self, shape, lengths, class_id, vec_cond, seq2seq_cond, seq2seq_mask, cls_free_guidance=1.0, vec_free_guidance=1.0, l2_normalize=False, invert=False, z_t=None):
         batch, device = shape[0], next(self.diffusion_model.parameters()).device
 
         time_pairs = self.get_sampling_timesteps(batch, device = device)
@@ -446,8 +532,7 @@ class GaussianDiffusion(nn.Module):
 
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step', total = self.sampling_timesteps):
             # get predicted x0
-
-            model_output = self.diffusion_model_predictions(z_t, mask, time, class_id=class_id, x_self_cond=x_start, seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask, sampling=True, cls_free_guidance=cls_free_guidance, l2_normalize=l2_normalize)
+            model_output = self.diffusion_model_predictions(z_t, mask, time, class_id=class_id, vec_cond=vec_cond, x_self_cond=x_start, seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask, sampling=True, cls_free_guidance=cls_free_guidance, vec_free_guidance=vec_free_guidance, l2_normalize=l2_normalize)
             # get alpha sigma of time and next time
 
             alpha = self.sampling_schedule(time)
@@ -483,7 +568,7 @@ class GaussianDiffusion(nn.Module):
     
 
     @torch.no_grad()
-    def sample(self, batch_size, length, class_id=None, seq2seq_cond=None, seq2seq_mask=None, cls_free_guidance=1.0, l2_normalize=False):
+    def sample(self, batch_size, length, class_id=None, vec_cond=None, seq2seq_cond=None, seq2seq_mask=None, cls_free_guidance=1.0, vec_free_guidance=1.0, l2_normalize=False):
         max_seq_len, latent_dim = self.max_seq_len, self.latent_dim
         
         if self.sampler == 'ddim':
@@ -494,7 +579,7 @@ class GaussianDiffusion(nn.Module):
             sample_fn = self.dpmpp_sample
         else:
             raise ValueError(f'invalid sampler {self.sampler}')
-        return sample_fn((batch_size, max_seq_len, latent_dim), length, class_id, seq2seq_cond, seq2seq_mask, cls_free_guidance, l2_normalize)
+        return sample_fn((batch_size, max_seq_len, latent_dim), length, class_id, vec_cond, seq2seq_cond, seq2seq_mask, cls_free_guidance, vec_free_guidance, l2_normalize)
 
     @property
     def loss_fn(self):
@@ -507,7 +592,8 @@ class GaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'invalid loss type {self.loss_type}')
 
-    def forward(self, txt_latent, mask, class_id, seq2seq_cond=None, seq2seq_mask=None, return_x_start=False, *args, **kwargs):
+    def forward(self, txt_latent, mask, class_id, vec_cond, seq2seq_cond=None, seq2seq_mask=None, return_x_start=False, weight = None, *args, **kwargs):
+        
         batch, l, d, device, max_seq_len, = *txt_latent.shape, txt_latent.device, self.max_seq_len
         assert l == max_seq_len, f'length must be {self.max_seq_len}'
         
@@ -522,6 +608,7 @@ class GaussianDiffusion(nn.Module):
         alpha = right_pad_dims_to(txt_latent, alpha)
 
         z_t = alpha.sqrt() * txt_latent + (1-alpha).sqrt() * noise
+        # z_t = torch.randn_like(z_t)
 
         # Perform unconditional generation with some probability
         if self.diffusion_model.class_conditional and self.diffusion_model.class_unconditional_prob > 0:
@@ -529,22 +616,28 @@ class GaussianDiffusion(nn.Module):
             class_unconditional_mask = self.class_unconditional_bernoulli.sample(class_id.shape).bool()
             class_id[class_unconditional_mask] = self.diffusion_model.num_classes
 
+        # if self.diffusion_model.vec_conditional and self.diffusion_model.vec_unconditional_prob > 0: #TODO: finish this
+        #     assert exists(vec_cond)
+        #     class_unconditional_mask = self.class_unconditional_bernoulli.sample(vec_cond.shape[0]).bool()
+        #     zero_vectors = torch.zeros(7, dtype=vec_cond.dtype, device=vec_cond.device)
+        #     vec_cond[class_unconditional_mask] = zero_vectors 
+            
+
         self_cond = None
 
         if self.self_condition and (random.random() < self.train_prob_self_cond):
             with torch.no_grad():
-                model_output = self.diffusion_model_predictions(z_t, mask, times, class_id=class_id, seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask)
+                model_output = self.diffusion_model_predictions(z_t, mask, times, class_id=class_id, vec_cond=vec_cond, seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask)
                 self_cond = model_output.pred_x_start.detach()
                 if self.l2_normalize:
                     self_cond = F.normalize(self_cond, dim=-1) * math.sqrt(self_cond.shape[-1])
-              
 
-        # predict and take gradient step
-
-        predictions = self.diffusion_model_predictions(z_t, mask, times, x_self_cond=self_cond, class_id=class_id, seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask)          
+        predictions = self.diffusion_model_predictions(z_t, mask, times, x_self_cond=self_cond, class_id=class_id, vec_cond=vec_cond, seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask, sampling=True)          
         if self.objective == 'pred_x0':
-            target = txt_latent
-            pred = predictions.pred_x_start
+            target = txt_latent 
+            # * weight
+            pred = predictions.pred_x_start 
+            # * weight
         elif self.objective == 'pred_noise':
             target = noise
             pred = predictions.pred_noise
@@ -552,17 +645,127 @@ class GaussianDiffusion(nn.Module):
             target = alpha.sqrt() * noise - (1-alpha).sqrt() * txt_latent
             assert exists(predictions.pred_v)
             pred = predictions.pred_v
-            
-        loss = self.loss_fn(pred, target, reduction = 'none')
-        loss = rearrange([reduce(loss[i][:torch.sum(mask[i])], 'l d -> 1', 'mean') for i in range(txt_latent.shape[0])], 'b 1 -> b 1')
+        
 
+
+        loss = self.loss_fn(pred, target, reduction = 'none') 
+        loss = rearrange([reduce(loss[i][:torch.sum(mask[i])], 'l d -> 1', 'mean') for i in range(txt_latent.shape[0])], 'b 1 -> b 1')
 
         if return_x_start:
             return loss.mean(), predictions.pred_x_start
-        return loss.mean()
+        return loss.mean(), pred, target
+    
+    def dpo_loss(self, txt_latent_w, txt_latent_l, mask_w,mask_l, model, ref_model, class_id, vec_cond, beta, seq2seq_cond_w=None, seq2seq_cond_l=None, seq2seq_mask_w=None, seq2seq_mask_l=None, return_x_start=False, rnet=None, decoder=None, tokenizer=None, *args, **kwargs):
+        
+        batch, l, d, device, max_seq_len, = *txt_latent_w.shape, txt_latent_l.device, self.max_seq_len
+        assert l == max_seq_len, f'length must be {self.max_seq_len}'
+        
+        # sample random times
+        times = torch.zeros((batch,), device = device).float().uniform_(0, 1.)
+        # noise sample
+        noise = torch.randn_like(txt_latent_w)
 
+        alpha = self.train_schedule(times)
+        alpha = right_pad_dims_to(txt_latent_w, alpha)
+
+        z_w_t = alpha.sqrt() * txt_latent_w + (1-alpha).sqrt() * noise
+        z_l_t = alpha.sqrt() * txt_latent_l + (1-alpha).sqrt() * noise
+        # z_t = torch.randn_like(z_t)
+            
+        ref_self_cond_w = None
+        ref_self_cond_l = None
+        self_cond_w = None
+        self_cond_l = None
+
+        if self.self_condition and (random.random() < self.train_prob_self_cond):
+            with torch.no_grad():
+                ref_model_w_x0 = self.diffusion_dpo_model_predictions(ref_model,z_w_t, mask_w, times, class_id=class_id, vec_cond=vec_cond,seq2seq_cond=seq2seq_cond_w, seq2seq_mask=seq2seq_mask_w)
+                ref_model_l_x0 = self.diffusion_dpo_model_predictions(ref_model,z_l_t, mask_l, times, class_id=class_id, vec_cond=vec_cond,seq2seq_cond=seq2seq_cond_l, seq2seq_mask=seq2seq_mask_l)
+                model_w_x0 = self.diffusion_dpo_model_predictions(model,z_w_t, mask_w, times, class_id=class_id, vec_cond=vec_cond, seq2seq_cond=seq2seq_cond_w, seq2seq_mask=seq2seq_mask_w)    
+                model_l_x0 = self.diffusion_dpo_model_predictions(model,z_l_t, mask_l, times, class_id=class_id, vec_cond=vec_cond, seq2seq_cond=seq2seq_cond_l, seq2seq_mask=seq2seq_mask_l)    
+        
+                ref_self_cond_w = ref_model_w_x0.pred_x_start.detach()
+                ref_self_cond_l = ref_model_l_x0.pred_x_start.detach()
+                self_cond_w = model_w_x0.pred_x_start.detach()
+                self_cond_l = model_l_x0.pred_x_start.detach()
+
+                if self.l2_normalize:
+                    ref_self_cond_w = F.normalize(ref_self_cond_w, dim=-1) * math.sqrt(ref_self_cond_w.shape[-1])
+                    ref_self_cond_l = F.normalize(ref_self_cond_l, dim=-1) * math.sqrt(ref_self_cond_l.shape[-1])
+                    self_cond_w = F.normalize(self_cond_w, dim=-1) * math.sqrt(self_cond_w.shape[-1])
+                    self_cond_l = F.normalize(self_cond_l, dim=-1) * math.sqrt(self_cond_l.shape[-1])
+
+        ref_model_w_x0 = self.diffusion_dpo_model_predictions(ref_model,z_w_t, mask_w, times, x_self_cond=ref_self_cond_w, class_id=class_id, vec_cond=vec_cond, seq2seq_cond=seq2seq_cond_w, seq2seq_mask=seq2seq_mask_w, sampling=True)    
+        ref_model_l_x0 = self.diffusion_dpo_model_predictions(ref_model,z_l_t, mask_l, times, x_self_cond=ref_self_cond_l, class_id=class_id, vec_cond=vec_cond, seq2seq_cond=seq2seq_cond_l, seq2seq_mask=seq2seq_mask_l, sampling=True)    
+        
+        model_w_x0 = self.diffusion_dpo_model_predictions(model,z_w_t, mask_w, times, x_self_cond=self_cond_w, class_id=class_id, vec_cond=vec_cond, seq2seq_cond=seq2seq_cond_w, seq2seq_mask=seq2seq_mask_w, sampling=True)    
+        model_l_x0 = self.diffusion_dpo_model_predictions(model,z_l_t, mask_l, times, x_self_cond=self_cond_l, class_id=class_id, vec_cond=vec_cond, seq2seq_cond=seq2seq_cond_l, seq2seq_mask=seq2seq_mask_l, sampling=True)    
+
+        if self.objective == 'pred_x0':
+            target_w = txt_latent_w
+            target_l = txt_latent_l
+            
+            pred_w_x0 = model_w_x0.pred_x_start
+            pred_l_x0 = model_l_x0.pred_x_start
+            model_w_error = (pred_w_x0 - target_w).pow(2).mean(dim=[1,2])
+            model_l_error = (pred_l_x0 - target_l).pow(2).mean(dim=[1,2])
+            model_diff = model_w_error - model_l_error
+
+            with torch.no_grad():
+                ref_pred_w_x0 = ref_model_w_x0.pred_x_start
+                ref_pred_l_x0 = ref_model_l_x0.pred_x_start
+                ref_w_error = (ref_pred_w_x0 - target_w).pow(2).mean(dim=[1,2])
+                ref_l_error = (ref_pred_l_x0 - target_l).pow(2).mean(dim=[1,2])
+                ref_diff = ref_w_error - ref_l_error
+
+            scale_term = -0.5 * beta
+            inside_term = scale_term * (model_diff - ref_diff)
+            loss = -1 * F.logsigmoid(inside_term).mean()
+            
+        elif self.objective == 'pred_noise':
+            target = noise
+            pred_w_x0 = model_w_x0.pred_noise
+            pred_l_x0 = model_l_x0.pred_noise
+            model_w_error = (pred_w_x0 - target).pow(2).mean(dim=[1,2])
+            model_l_error = (pred_l_x0 - target).pow(2).mean(dim=[1,2])
+            model_diff = model_w_error - model_l_error
+
+            with torch.no_grad():
+                ref_pred_w_x0 = ref_model_w_x0.pred_noise
+                ref_pred_l_x0 = ref_model_l_x0.pred_noise
+                ref_w_error = (ref_pred_w_x0 - target).pow(2).mean(dim=[1,2])
+                ref_l_error = (ref_pred_l_x0 - target).pow(2).mean(dim=[1,2])
+                ref_diff = ref_w_error - ref_l_error
+
+            scale_term = -0.5 * beta
+            inside_term = scale_term * (model_diff - ref_diff)
+            loss = -1 * F.logsigmoid(inside_term).mean()
+
+        elif self.objective == 'pred_v':
+            target_w = alpha.sqrt() * noise - (1-alpha).sqrt() * txt_latent_w
+            target_l = alpha.sqrt() * noise - (1-alpha).sqrt() * txt_latent_l
+            assert exists(ref_model_w_x0.pred_v) and exists(ref_model_l_x0.pred_v) and exists(model_w_x0.pred_v) and exists(model_l_x0.pred_v)
+            pred_w_x0 = model_w_x0.pred_x_start
+            pred_l_x0 = model_l_x0.pred_x_start
+            model_w_error = (pred_w_x0 - target_w).pow(2).mean(dim=[1,2])
+            model_l_error = (pred_l_x0 - target_l).pow(2).mean(dim=[1,2])
+            model_diff = model_w_error - model_l_error
+
+            with torch.no_grad():
+                ref_pred_w_x0 = ref_model_w_x0.pred_x_start
+                ref_pred_l_x0 = ref_model_l_x0.pred_x_start
+                ref_w_error = (ref_pred_w_x0 - target_w).pow(2).mean(dim=[1,2])
+                ref_l_error = (ref_pred_l_x0 - target_l).pow(2).mean(dim=[1,2])
+                ref_diff = ref_w_error - ref_l_error
+
+            scale_term = -0.5 * beta
+            inside_term = scale_term * (model_diff - ref_diff)
+            loss = -1 * F.logsigmoid(inside_term).mean()
+
+        return loss
+    
+        
 # trainer class
-
 class Trainer(object):
     def __init__(
         self,
@@ -581,7 +784,7 @@ class Trainer(object):
         ema_decay = 0.995,
         adam_betas = (0.9, 0.99),
         adam_weight_decay = 0.01,
-        save_and_sample_every = 5000,
+        save_and_sample_every = 100,
         num_samples = 25,
         seq2seq_candidates = 10,
         seq2seq_train_context_encoder = False,
@@ -589,10 +792,11 @@ class Trainer(object):
         amp = False,
         mixed_precision = 'no',
         decoding_loss = False,
-        decoding_loss_weight = 1.0,
+        decoding_loss_weight = 1,
+        task = "phenotype",
+        fingerprint = "morgan",
     ):
         super().__init__()
-
 
         set_seeds(42)
 
@@ -618,15 +822,15 @@ class Trainer(object):
             results_folder = args.output_dir
             run = os.path.split(__file__)[-1].split(".")[0]
             if args.wandb_name:
-                self.accelerator.init_trackers(run, config=args, init_kwargs={"wandb": {"dir": results_folder, "name": args.wandb_name}})
+                self.accelerator.init_trackers(run, config=args, init_kwargs={"wandb": {"dir": results_folder, "name": args.wandb_name, "entity": "raswanth"}})
             else:
-                self.accelerator.init_trackers(run, config=args, init_kwargs={"wandb": {"dir": results_folder}})
-
-        
+                self.accelerator.init_trackers(run, config=args, init_kwargs={"wandb": {"dir": results_folder, "entity": "raswanth"}})
 
         self.diffusion = diffusion
         self.decoding_loss = decoding_loss
         self.decoding_loss_weight = decoding_loss_weight
+        self.decoder_loss_fn = nn.CrossEntropyLoss()
+        self.fingerprint = fingerprint
 
         self.num_samples = num_samples
         self.seq2seq_candidates = seq2seq_candidates
@@ -635,16 +839,17 @@ class Trainer(object):
         self.train_batch_size = train_batch_size
         self.eval_batch_size = eval_batch_size
         self.gradient_accumulate_every = gradient_accumulate_every
+        self.task = task
 
         self.train_num_steps = train_num_steps
         self.max_seq_len = diffusion.max_seq_len
 
         self.latent_model_path = args.latent_model_path
-
+        self.use_my_latent_model = args.use_my_latent_model
         self.enc_dec_model = args.enc_dec_model
 
         # Init Encoder-decoder model
-        if 'bart' in args.enc_dec_model:
+        if 'bart' or 'MolGen' in args.enc_dec_model:
             self.bart_model = BartForConditionalGeneration.from_pretrained(args.enc_dec_model)
         elif 'flan-t5' in args.enc_dec_model:
             self.bart_model = T5ForConditionalGeneration.from_pretrained(args.enc_dec_model, torch_dtype=torch.bfloat16)
@@ -652,11 +857,13 @@ class Trainer(object):
             self.bart_model = MT5ForConditionalGeneration.from_pretrained(args.enc_dec_model, torch_dtype=torch.bfloat16)
         else:
             raise ValueError(f'invalid enc_dec_model {args.enc_dec_model}')
+        
         self.tokenizer = AutoTokenizer.from_pretrained(args.enc_dec_model)
 
         self.diffusion.using_latent_model = False
         self.seq2seq = self.diffusion.diffusion_model.seq2seq
         self.class_conditional = self.diffusion.diffusion_model.class_conditional
+        self.vec_conditional = self.diffusion.diffusion_model.vec_conditional # added the swtich for vector conditioning
         self.seq2seq_unconditional_prob = self.diffusion.seq2seq_unconditional_prob
         self.best_seq2seq_metric = 0
         self.context_tokenizer = None
@@ -675,10 +882,21 @@ class Trainer(object):
                 for param in self.diffusion.context_encoder.parameters():
                     param.requires_grad = False
 
+            config = self.bart_model.config
+            self.cnet = Compression_Net(dim = config.d_model, depth = 3,dim_head = 64,heads = 8, num_latents = 32, num_media_embeds = 4,ff_mult = 4,compress_dim = 64).to(device)
+            self.rnet = Reconstruction_Net(dim = 64,depth = 3,dim_head = 64,heads = 8,num_latents = 32, num_media_embeds = 4,ff_mult = 4,reconstruct_dim = config.d_model).to(device)
+            state_dict = torch.load("saved_latent_models/SELFormer-selfies/2024-07-16_01-53-07/model.pth",map_location=device)
+            self.cnet.load_state_dict(state_dict['compression_state_dict'], strict=True)
+            self.rnet.load_state_dict(state_dict['reconstruction_state_dict'], strict=True)
+
+            for param in self.cnet.parameters():
+                param.requires_grad = False
+
+            # for param in self.rnet.parameters():
+            #     param.requires_grad = False
+
             self.context_tokenizer = self.tokenizer
             self.bart_model, self.tokenizer, _ = get_latent_model(latent_argparse)
-            data = torch.load(os.path.join(args.latent_model_path, 'model.pt'), map_location=device)
-            self.bart_model.load_state_dict(data['model'])
             self.diffusion.max_seq_len = self.bart_model.num_encoder_latents
             self.num_encoder_latents = self.bart_model.num_encoder_latents
             self.diffusion.using_latent_model = True
@@ -689,27 +907,70 @@ class Trainer(object):
                 param.requires_grad = False
         self.using_latent_model = self.diffusion.using_latent_model
         self.bart_model.eval()
-            
+        
+        #optimizer
+        self.opt = optimizer.get_adamw_optimizer(diffusion.parameters(), lr = train_lr, betas = adam_betas, weight_decay=adam_weight_decay)
 
-        # dataset and dataloader
-        self.dataset_name = dataset_name
-        dataset = text_dataset.get_dataset(dataset_name,)
+        # scheduler
+        lr_scheduler = get_scheduler(
+            lr_schedule,
+            optimizer=self.opt,
+            num_warmup_steps=num_warmup_steps*self.num_devices,
+            num_training_steps=train_num_steps*self.num_devices,
+        )
+        # for logging results in a folder periodically
+        if self.accelerator.is_main_process:
+            self.ema = EMA(diffusion, beta = ema_decay, update_every = ema_update_every, power=3/4)
 
-        self.dataset = dataset.shuffle(seed=42)
+            self.results_folder = Path(results_folder)
+            self.results_folder.mkdir(exist_ok = True)
+
+        # step counter state
+        self.step = 0
+        
+        if self.task == "phenotype_clip" or self.task == "phenotype":
+            if self.task == "phenotype_clip":
+                data = Phenotype_CLIP(
+                        train_path = "/raid/home/rohlan/clipDRUG/experiments/selfies_vae/mcf7_SC/logs/molgene_supcon_proj/gene_embeds_2k48.pt",
+                        val_path = "/raid/home/rohlan/clipDRUG/experiments/selfies_vae/mcf7_SC/logs/molgene_supcon_proj/gene_embeds_2k48.pt",
+                        test_path = "/raid/home/rohlan/clipDRUG/experiments/selfies_vae/mcf7_SC/logs/molgene_supcon_proj/gene_embeds_2k48.pt"
+                        )
+            else:
+                data = Phenotype(
+                        train_path = ["/raid/home/rohlan/clipDRUG/data/mcf7_SC/mcf7_SC_data_train.csv","/raid/home/rohlan/clipDRUG/data/mcf7_SC/mcf7_SC_data_val.csv","/raid/home/rohlan/clipDRUG/data/mcf7_SC/mcf7_SC_data_train.csv"],
+                        val_path = "/raid/home/rohlan/clipDRUG/data/mcf7_SC/scPerturb_samples_mcf7_SC.pt",
+                        test_path = "/raid/home/rohlan/clipDRUG/data/mcf7_SC/scPerturb_samples_mcf7_SC.pt")
+            self.dataloader, self.val_dataloader, self.test_dataloader, self.dataset = data.gene_dataset(train_batch_sze = train_batch_size, val_batch_sze = eval_batch_size,test_batch_sze = eval_batch_size)
+            if self.fingerprint == "morgan":
+                self.true_novelty_data = [AllChem.GetMorganFingerprintAsBitVect(Chem.MolFromSmiles(sf.decoder(s["selfies"])), 3, 2048) for s in self.dataset["train"] if Chem.MolFromSmiles(sf.decoder(s["selfies"])) is not None]
+            else:
+                self.true_novelty_data = [MACCSkeys.GenMACCSKeys(Chem.MolFromSmiles(sf.decoder(s["selfies"]))) for s in self.dataset["train"] if Chem.MolFromSmiles(sf.decoder(s["selfies"])) is not None]
+        elif self.task == "multi-objective":
+            data = MultiObjective(dataset_path = 'datasets')
+            self.dataloader, self.val_dataloader, self.test_dataloader, self.dataset, self.valdataset = data.multiobj_dataset(train_batch_sze = train_batch_size, val_batch_sze = eval_batch_size,test_batch_sze = eval_batch_size, task = "diffusion training")
+            if self.fingerprint == "morgan":
+                self.true_novelty_data = [AllChem.GetMorganFingerprintAsBitVect(Chem.MolFromSmiles(sf.decoder(s["selfies"])), 3, 2048) for s in self.dataset["train"] if Chem.MolFromSmiles(sf.decoder(s["selfies"])) is not None]
+            else:
+                self.true_novelty_data = [MACCSkeys.GenMACCSKeys(Chem.MolFromSmiles(sf.decoder(s["selfies"]))) for s in self.dataset["train"] if Chem.MolFromSmiles(sf.decoder(s["selfies"])) is not None]
+        elif self.task == "dpo_training":
+            data = DPO()
+            self.dataloader, self.val_dataloader, self.dataset, self.valdataset = data.dpo_dataset(train_batch_sze = train_batch_size, val_batch_sze = eval_batch_size)
+            if self.fingerprint == "morgan":
+                self.true_novelty_data = [AllChem.GetMorganFingerprintAsBitVect(Chem.MolFromSmiles(sf.decoder(s["selfies_w"])), 3, 2048) for s in self.dataset["train"] if Chem.MolFromSmiles(sf.decoder(s["selfies_w"])) is not None]
+            else:
+                self.true_novelty_data = [MACCSkeys.GenMACCSKeys(Chem.MolFromSmiles(sf.decoder(s["selfies_w"]))) for s in self.dataset["train"] if Chem.MolFromSmiles(sf.decoder(s["selfies_w"])) is not None]
+        else:
+            raise NotImplementedError
+
         if args.eval_test:
             self.num_samples = min(self.num_samples,len(self.dataset['test']))
             print(f'Using {self.num_samples} samples for evaluation')
         else:
-            self.num_samples = min(self.num_samples,len(self.dataset['valid']))
+            self.num_samples = min(self.num_samples,len(self.dataset['val']))
             print(f'Using {self.num_samples} samples for evaluation')
-        # Subsample train and val splits for computing language generation during runtime
-        
-        self.train_val_dataloader = text_dataset.get_dataloader(args, dataset['train'].select(range(1000)), self.bart_model.config, self.tokenizer, self.max_seq_len, shuffle=False, context_tokenizer=self.context_tokenizer)
+
         if args.resume_training:
-            dataset['train'] = dataset['train'].shuffle()
-        self.dataloader = text_dataset.get_dataloader(args, self.dataset['train'], self.bart_model.config, self.tokenizer, self.max_seq_len, context_tokenizer=self.context_tokenizer)
-        self.val_dataloader = text_dataset.get_dataloader(args, self.dataset['valid'], self.bart_model.config, self.tokenizer, self.max_seq_len, shuffle=False, context_tokenizer=self.context_tokenizer)
-        self.test_dataloader = text_dataset.get_dataloader(args, self.dataset['test'], self.bart_model.config, self.tokenizer, self.max_seq_len, shuffle=False, context_tokenizer=self.context_tokenizer)
+            self.dataset['train'] = self.dataset['train'].shuffle()
 
         if not self.seq2seq:
             training_lengths = [min(sum(self.dataloader.dataset[idx]['attention_mask']), self.max_seq_len) for idx in range(self.dataloader.dataset.num_rows)]
@@ -723,34 +984,8 @@ class Trainer(object):
             label_counts = Counter(training_labels)
             probs = torch.tensor([label_counts[idx]/self.dataloader.dataset.num_rows for idx in range(self.diffusion.diffusion_model.num_classes)])
             self.class_categorical = torch.distributions.Categorical(probs=probs)
-        
-        # optimizer
-
-        self.opt = optimizer.get_adamw_optimizer(diffusion.parameters(), lr = train_lr, betas = adam_betas, weight_decay=adam_weight_decay)
-
-        # scheduler
-
-        lr_scheduler = get_scheduler(
-            lr_schedule,
-            optimizer=self.opt,
-            num_warmup_steps=num_warmup_steps*self.num_devices,
-            num_training_steps=train_num_steps*self.num_devices,
-        )
-
-        # for logging results in a folder periodically
-
-        if self.accelerator.is_main_process:
-            self.ema = EMA(diffusion, beta = ema_decay, update_every = ema_update_every, power=3/4)
-
-            self.results_folder = Path(results_folder)
-            self.results_folder.mkdir(exist_ok = True)
-
-        # step counter state
-
-        self.step = 0
 
         # prepare model, dataloader, optimizer with accelerator
-
         self.diffusion, self.bart_model, self.opt, self.dataloader, self.lr_scheduler = self.accelerator.prepare(self.diffusion, self.bart_model, self.opt, self.dataloader, lr_scheduler)
         self.data_iter = cycle(self.dataloader)
         self.val_iter = cycle(self.val_dataloader)
@@ -792,7 +1027,6 @@ class Trainer(object):
         if init_only:
             return
         self.step = data['step']
-        
         if 'scheduler' in data:
             self.lr_scheduler.load_state_dict(data['scheduler'])
         # For backwards compatibility with earlier models
@@ -802,10 +1036,11 @@ class Trainer(object):
 
     def log_reference_metrics(self, test=False):
         accelerator = self.accelerator
+        att_name = 'selfies' #change it to 'selfies' when your runnning this function
         if test:
-            train_subset = self.dataset['train']['text'][:self.num_samples]
-            train_subset2 = self.dataset['train']['text'][self.num_samples:(2*self.num_samples)] 
-            test_subset = self.dataset['test']['text'][:self.num_samples]
+            train_subset = self.dataset['train'][att_name][:self.num_samples]
+            train_subset2 = self.dataset['train'][att_name][self.num_samples:(2*self.num_samples)] 
+            test_subset = self.dataset['test'][att_name][:self.num_samples]
             self.reference_dict['reference/test_perplexity'] = evaluation.compute_perplexity(test_subset)
             for mauve_model_id in ["gpt2-large"]:
                 self.reference_dict[f'reference/{mauve_model_id}_train_test_mauve'], _ = evaluation.compute_mauve(train_subset, test_subset, mauve_model_id)
@@ -813,35 +1048,389 @@ class Trainer(object):
                 ngram_metrics = evaluation.compute_diversity(test_subset)
             for k, v in ngram_metrics.items():
                 self.reference_dict[f"reference/test_{k}"] = v
-            self.reference_dict[f"reference/test_memorization"] = evaluation.compute_memorization(test_subset, self.dataset['train']['text'])
+            self.reference_dict[f"reference/test_memorization"] = evaluation.compute_memorization(test_subset, self.dataset['train'][att_name])
             self.reference_dict['reference/test_unique_wordcount'] = evaluation.compute_wordcount(test_subset)
             return
 
-        val_subset = self.dataset['valid']['text'][:self.num_samples]
-        train_subset = self.dataset['train']['text'][:self.num_samples]
-        train_subset2 = self.dataset['train']['text'][self.num_samples:(2*self.num_samples)] 
+        val_subset = [example["selfies"] for example in self.dataset["val"]][:self.num_samples]
+        train_set = [example["selfies"] for example in self.dataset["train"]]
+        train_subset = train_set[:self.num_samples]
+        train_subset2 = train_set[self.num_samples:2*self.num_samples]
         self.reference_dict['reference/train_perplexity'] = evaluation.compute_perplexity(train_subset)
         self.reference_dict['reference/val_perplexity'] = evaluation.compute_perplexity(val_subset)
         for mauve_model_id in ["gpt2-large"]:
             self.reference_dict[f'reference/{mauve_model_id}_train_val_mauve'], _ = evaluation.compute_mauve(train_subset, val_subset, mauve_model_id)
             self.reference_dict[f'reference/{mauve_model_id}_train_train_mauve'], _ = evaluation.compute_mauve(train_subset, train_subset2, mauve_model_id)
-        ngram_metrics = evaluation.compute_diversity(val_subset)
-        for k, v in ngram_metrics.items():
-            self.reference_dict[f"reference/val_{k}"] = v
-        ngram_metrics = evaluation.compute_diversity(train_subset)
-        for k, v in ngram_metrics.items():
-            self.reference_dict[f"reference/train_{k}"] = v
-        self.reference_dict[f"reference/val_memorization"] = evaluation.compute_memorization(val_subset, self.dataset['train']['text'])
         self.reference_dict['reference/train_unique_wordcount'] = evaluation.compute_wordcount(train_subset)
         self.reference_dict['reference/val_unique_wordcounts'] = evaluation.compute_wordcount(val_subset)
         torch.cuda.empty_cache() 
-            
-            
+
+    # @torch.no_grad()
+    # def chemical_sampling()
+        
+    
     @torch.no_grad()
-    def sample(self, num_samples=None, class_id=None, seed=42, test=False, cls_free_guidance=1.0):
+    def phenotype_drug_design(self, num_samples=2, test=False, num_samples_per_gene=2, vec_free_guidance=1.0, using_vec_cond = False, seed=42):
+        num_samples = default(num_samples, self.num_samples)
+        accelerator = self.accelerator
+        device = accelerator.device  
+        torch.cuda.empty_cache()
+
+        self.ema.ema_model.eval()
+        gene_cond_lst_all = []
+        selfies_test_dataset_all = []
+        seq2seq_cond_all = []
+        seq2seq_mask_all = []
+        diffusion = accelerator.unwrap_model(self.diffusion)
+        if test:
+            random_indices = random.sample(range(len(self.dataset['test'])), num_samples)
+            for batch in self.test_dataloader:
+                gene_cond_lst_all.extend(batch["vec_cond"])  # Convert tensors to lists if necessary
+                selfies_test_dataset_all.extend(batch["selfies"])
+                seq2seq_cond_all.extend(diffusion.context_encoder(input_ids = batch['input_ids'], attention_mask = batch['attention_mask']).last_hidden_state.float().to('cpu'))
+                seq2seq_mask_all.extend(batch['attention_mask'].bool().to('cpu'))
+            
+            assert len(selfies_test_dataset_all) == len(self.dataset['test']) and len(gene_cond_lst_all) == len(self.dataset['test'])
+        else:
+            random_indices = random.sample(range(len(self.dataset['val'])), num_samples)
+            for batch in self.val_dataloader:
+                gene_cond_lst_all.extend(batch["vec_cond"])  # Convert tensors to lists if necessary
+                selfies_test_dataset_all.extend(batch["selfies"])
+            assert len(selfies_test_dataset_all) == len(self.dataset['val']) and len(gene_cond_lst_all) == len(self.dataset['val'])
+        
+        gene_cond_lst = [gene_cond_lst_all[i] for i in random_indices]
+        selfies_test_dataset = [selfies_test_dataset_all[i] for i in random_indices] 
+
+        selfies_train_dataset = []
+        for batch in self.dataloader:
+                selfies_train_dataset.extend(batch["selfies"])   
+    
+        # Stores generation outputs for each strategy
+                
+        all_texts_lists = {}
+        total_gen_selfies = {k:0 for k,_ in constant.generate_kwargs.items()}
+        total_valid_selfies = {k:0 for k,_ in constant.generate_kwargs.items()}
+        total_unique_selfies = {k:0 for k,_ in constant.generate_kwargs.items()}
+        average_tanimoto = {k:0 for k,_ in constant.generate_kwargs.items()}
+        best_gen_set = {k:[] for k,_ in constant.generate_kwargs.items()}
+
+        torch.manual_seed(seed)
+
+        def get_vec_n(vec_cond, n):
+            if using_vec_cond:
+                return vec_cond.repeat(n,1).to(device)
+            else:
+                return None
+
+        for i in range(num_samples):
+            gene_exprs = gene_cond_lst[i]
+            gene_texts_lists = {k:[] for k,_ in constant.generate_kwargs.items()}
+            if all_texts_lists.get(selfies_test_dataset[i]) != None:
+                pass
+            else:
+                while min([len(gene_texts_lists[ele]) for ele in gene_texts_lists]) < num_samples_per_gene:
+                    batches = num_to_groups(num_samples_per_gene-min([len(gene_texts_lists[ele]) for ele in gene_texts_lists]), max(self.eval_batch_size,self.train_batch_size))
+                    model_outputs = list(map(lambda n: tuple(x for x in self.ema.ema_model.sample(batch_size=n, length=None, vec_cond=get_vec_n(gene_exprs,n), vec_free_guidance=vec_free_guidance)), batches))
+                    for (latents, mask) in model_outputs:
+                        latents, mask = latents.to(device), mask.to(device)
+                        if self.args.normalize_latent:
+                            latents = self.ema.ema_model.unnormalize_latent(latents)
+                        for k, kwargs in constant.generate_kwargs.items():
+                            if self.latent_model_path:
+                                attention_mask = None
+                                if self.use_my_latent_model:
+                                    encoder_output = BaseModelOutput(last_hidden_state=self.rnet(latents.clone()))
+                                else:
+                                    encoder_output = BaseModelOutput(last_hidden_state=self.bart_model.get_decoder_input(latents.clone()))
+                            else:
+                                attention_mask = mask.clone()
+                                encoder_output = BaseModelOutput(last_hidden_state=latents.clone())
+                            # sample_ids = self.bart_model.generate(encoder_outputs=encoder_output, attention_mask=attention_mask, **kwargs)
+                            if k=="beam":
+                                sample_ids = self.bart_model.generate(encoder_outputs=encoder_output, max_new_tokens = 1024)
+                            else:
+                                sample_ids = self.bart_model.generate(encoder_outputs=encoder_output, attention_mask=attention_mask, **kwargs)
+                            selfies_list = [self.tokenizer.decode(g, skip_special_tokens=True, clean_up_tokenization_spaces=True) for g in sample_ids]
+                            total_gen_selfies[k] += len(selfies_list)
+                            selfies_list = [selfie.strip() for selfie in selfies_list if len(selfie.strip())>0 and Chem.MolFromSmiles(sf.decoder(selfie)) != None]
+                            total_valid_selfies[k] += len(selfies_list)
+                            total_unique_selfies[k] += len(set(selfies_list))
+                            gene_texts_lists[k].extend(selfies_list)
+                    
+                assert min([len(gene_texts_lists[ele]) for ele in gene_texts_lists]) >= num_samples_per_gene
+                selfies_generations = {k:v[:num_samples_per_gene] for k,v in gene_texts_lists.items()}
+                all_texts_lists[selfies_test_dataset[i]] = selfies_generations
+        
+        
+        max_test = {}
+        ged_oracle = Oracle(name = 'QED')
+        sa_oracle = Oracle(name = 'SA')
+        for og_chem, gen_chem in all_texts_lists.items():
+            if self.fingerprint == "morgan": 
+                og_mol = AllChem.GetMorganFingerprintAsBitVect(Chem.MolFromSmiles(sf.decoder(og_chem)), 3, 2048)
+            else:
+                og_mol = MACCSkeys.GenMACCSKeys(Chem.MolFromSmiles(sf.decoder(og_chem)))
+            for strategy, selfie_per_gene in gen_chem.items():
+                pred_smiles = [sf.decoder(s) for s in selfie_per_gene]
+                pred_mols = [Chem.MolFromSmiles(s) for s in pred_smiles]
+                if self.fingerprint == "morgan":
+                    pred_fps = [AllChem.GetMorganFingerprintAsBitVect(x, 3, 2048) for x in pred_mols]
+                else: 
+                    pred_fps = [MACCSkeys.GenMACCSKeys(x) for x in pred_mols]
+                sample_similarity = DataStructs.BulkTanimotoSimilarity(og_mol, pred_fps)
+                # sample_similarity = [ged_oracle(pred_smiles[i]) + sa_oracle(pred_smiles[i]) + (j-0.4) for i,j in enumerate(sample_similarity)]
+                best_gen_set[strategy].append(selfie_per_gene[np.argmax(sample_similarity)])
+                if max_test.get(strategy) == None:
+                    max_test[strategy] = []
+                max_test[strategy].append(np.max(sample_similarity))
+                
+        sns.kdeplot(max_test["beam"], shade=True, color="red", label="TS")
+        plt.savefig("diffusion_TS_raw_trained.png")
+        metrics = {}
+        torch.cuda.empty_cache()
+        # compute metics 
+        for strategy in constant.generate_kwargs.keys():
+            metrics[f'model/{strategy}/validity'] = total_valid_selfies[strategy]/total_gen_selfies[strategy]
+            metrics[f"model/{strategy}/uniqueness"] = total_unique_selfies[strategy]/total_valid_selfies[strategy]
+            metrics[f"model/{strategy}/novelty"] = chem_evaluation.novelty(best_gen_set[strategy], self.true_novelty_data, "selfies", similarity_type=self.fingerprint)
+            metrics[f"model/{strategy}/diversity"] = chem_evaluation.diversity(best_gen_set[strategy], "selfies", similarity_type=self.fingerprint)
+            metrics[f"model/{strategy}/TS"] = chem_evaluation.compute_average_tanimoto(list(all_texts_lists.keys()),best_gen_set[strategy], similarity_type=self.fingerprint)
+
+        print(metrics)
+        accelerator.log(metrics, self.step)
+        torch.cuda.empty_cache() 
+        self.diffusion.to(device)
+        self.ema.to(device)
+
+    @torch.no_grad()
+    def multiobj_drug_design(self, num_samples=2, test=False, num_samples_per_multiobj=2, vec_free_guidance=1.0, using_vec_cond = False, seed=42, dpo_training=False):
         num_samples = default(num_samples, self.num_samples)
         accelerator = self.accelerator
         device = accelerator.device
+        # self.diffusion.to('cpu')   
+        torch.cuda.empty_cache()
+        multiobj_cond_lst_all = []
+        selfies_test_dataset_all = []
+        if not dpo_training:
+            self.ema.ema_model.eval()
+            if test:
+                random_indices = random.sample(range(len(self.dataset['test'])), num_samples)
+                for batch in self.test_dataloader:
+                    multiobj_cond_lst_all.extend(batch["vec_cond"])  # Convert tensors to lists if necessary
+                    selfies_test_dataset_all.extend(batch["selfies"])
+            else:
+                random_indices = random.sample(range(len(self.dataset['val'])), num_samples)
+                for index in random_indices:
+                    multiobj_cond_lst_all.append(self.valdataset[index]["vec_cond"])
+                    selfies_test_dataset_all.append(self.valdataset[index]["selfies"])
+            
+            selfies_train_dataset = []
+            selfies_train_dataset.extend(self.dataset["train"][:len(self.dataset["train"])]["selfies"])
+        else:
+            self.dpo_diffusion.eval()
+            random_indices = random.sample(range(len(self.dataset['val'])), num_samples)
+            for batch in self.val_dataloader:
+                multiobj_cond_lst_all.extend(batch["vec_cond"])  # Convert tensors to lists if necessary
+                selfies_test_dataset_all.extend(batch["selfies_w"])
+            selfies_train_dataset = []
+            selfies_train_dataset.extend(self.dataset["train"][:len(self.dataset["train"])]["selfies_w"])
+
+        multiobj_cond_lst = multiobj_cond_lst_all
+        selfies_test_dataset = selfies_test_dataset_all
+
+        all_texts_lists = {}
+        total_gen_selfies = {k:0 for k,_ in constant.generate_kwargs.items()}
+        total_valid_selfies = {k:0 for k,_ in constant.generate_kwargs.items()}
+        total_unique_selfies = {k:0 for k,_ in constant.generate_kwargs.items()}
+        average_tanimoto = {k:0 for k,_ in constant.generate_kwargs.items()}
+        best_gen_set = {k:[] for k,_ in constant.generate_kwargs.items()}
+
+        torch.manual_seed(seed)
+
+        def get_vec_n(vec_cond, n):
+            if using_vec_cond:
+                return vec_cond.repeat(n,1).to(device)
+            else:
+                return None
+        for i in range(num_samples):
+            multiobj_exprs = multiobj_cond_lst[i]
+            multiobj_texts_lists = {k:[] for k,_ in constant.generate_kwargs.items()}
+            if all_texts_lists.get(selfies_test_dataset[i]) != None:
+                pass
+            else:
+                while min([len(multiobj_texts_lists[ele]) for ele in multiobj_texts_lists]) < num_samples_per_multiobj:
+                    batches = num_to_groups(num_samples_per_multiobj-min([len(multiobj_texts_lists[ele]) for ele in multiobj_texts_lists]), max(self.eval_batch_size,self.train_batch_size))
+                    if dpo_training:
+                        model_outputs = list(map(lambda n: tuple(x for x in self.dpo_diffusion.sample(batch_size=n, length=None, vec_cond=get_vec_n(multiobj_exprs,n), vec_free_guidance=vec_free_guidance)), batches))
+                    else:
+                        model_outputs = list(map(lambda n: tuple(x for x in self.ema.ema_model.sample(batch_size=n, length=None, vec_cond=get_vec_n(multiobj_exprs,n), vec_free_guidance=vec_free_guidance)), batches))
+                    for (latents, mask) in model_outputs:
+                        latents, mask = latents.to(device), mask.to(device)
+                        if self.args.normalize_latent:
+                            if dpo_training:
+                                latents = self.dpo_diffusion.unnormalize_latent(latents)
+                            else:
+                                latents = self.ema.ema_model.unnormalize_latent(latents)
+                        for k, kwargs in constant.generate_kwargs.items():
+                            if self.latent_model_path:
+                                attention_mask = None
+                                if self.use_my_latent_model:
+                                    encoder_output = BaseModelOutput(last_hidden_state=self.rnet(latents.clone()))
+                                else:
+                                    encoder_output = BaseModelOutput(last_hidden_state=self.bart_model.get_decoder_input(latents.clone()))
+                            else:
+                                attention_mask = mask.clone()
+                                encoder_output = BaseModelOutput(last_hidden_state=latents.clone())
+                            # sample_ids = self.bart_model.generate(encoder_outputs=encoder_output, attention_mask=attention_mask, **kwargs)
+                            if k=="beam":
+                                sample_ids = self.bart_model.generate(encoder_outputs=encoder_output, max_new_tokens = 1024)
+                            else:
+                                sample_ids = self.bart_model.generate(encoder_outputs=encoder_output, attention_mask=attention_mask, **kwargs)
+                            selfies_list = [self.tokenizer.decode(g, skip_special_tokens=True, clean_up_tokenization_spaces=True) for g in sample_ids]
+                            total_gen_selfies[k] += len(selfies_list)
+                            selfies_list = [selfie.strip() for selfie in selfies_list if len(selfie.strip())>0 and Chem.MolFromSmiles(sf.decoder(selfie)) != None]
+                            total_valid_selfies[k] += len(selfies_list)
+                            total_unique_selfies[k] += len(set(selfies_list))
+                            multiobj_texts_lists[k].extend(selfies_list)
+                    
+                assert min([len(multiobj_texts_lists[ele]) for ele in multiobj_texts_lists]) >= num_samples_per_multiobj
+                selfies_generations = {k:v[:num_samples_per_multiobj] for k,v in multiobj_texts_lists.items()}
+                all_texts_lists[selfies_test_dataset[i]] = selfies_generations
+        
+        max_test = {}
+        gsk3_oracle = Oracle(name = 'GSK3B')
+        jnk3_oracle = Oracle(name = 'JNK3')
+        gen_mols = {}
+        for og_chem, gen_chem in all_texts_lists.items():
+            og_mol = AllChem.GetMorganFingerprintAsBitVect(Chem.MolFromSmiles(sf.decoder(og_chem)), 3, 2048)
+            for strategy, selfie_per_gene in gen_chem.items():
+                pred_smiles = [sf.decoder(s) for s in selfie_per_gene]
+                pred_mols = [Chem.MolFromSmiles(s) for s in pred_smiles]
+                pred_fps = [AllChem.GetMorganFingerprintAsBitVect(x, 3, 2048) for x in pred_mols]
+                sample_similarity = DataStructs.BulkTanimotoSimilarity(og_mol, pred_fps)
+                # sample_similarity = [jnk3_oracle(pred_smiles[i]) + gsk3_oracle(pred_smiles[i]) - (0.3-j)**2 for i,j in enumerate(sample_similarity)]
+                best_gen_set[strategy].append(selfie_per_gene[np.argmax(sample_similarity)])
+                if max_test.get(strategy) == None:
+                    max_test[strategy] = []
+                    gen_mols[strategy] = []
+                gen_mols[strategy] += pred_smiles
+                max_test[strategy].append(np.max(sample_similarity))
+        
+        # jnk3_mols = [jnk3_oracle(s) for s in gen_mols["beam"]]
+        # sns.kdeplot(jnk3_mols, shade=True, color="red", label="TS") 
+        # plt.savefig("Jnk3_all.png")
+        # plt.clf()
+        # jnk3_mols = [jnk3_oracle(sf.decoder(s)) for s in best_gen_set["beam"]]
+        # sns.kdeplot(jnk3_mols, shade=True, color="red", label="TS") 
+        # plt.savefig("Jnk3.png")
+        # plt.clf()
+        # gsk3_mols = [gsk3_oracle(s) for s in gen_mols["beam"]]
+        # sns.kdeplot(gsk3_mols, shade=True, color="red", label="TS")
+        # plt.savefig("Gsk3_all.png")
+        # plt.clf()
+        # gsk3_mols = [gsk3_oracle(sf.decoder(s)) for s in best_gen_set["beam"]]
+        # sns.kdeplot(gsk3_mols, shade=True, color="red", label="TS")
+        # plt.savefig("Gsk3.png")
+        # plt.clf()
+        
+        metrics = {}
+        # self.ema.to('cpu')
+        torch.cuda.empty_cache()
+        # compute metics 
+        for strategy in constant.generate_kwargs.keys():
+            # metrics[f'model/{strategy}/validity'] = total_valid_selfies[strategy]/total_gen_selfies[strategy]
+            metrics[f"model/{strategy}/uniqueness"] = total_unique_selfies[strategy]/total_valid_selfies[strategy]
+            metrics[f"model/{strategy}/novelty"] = chem_evaluation.novelty(best_gen_set[strategy], self.true_novelty_data, "selfies", similarity_type="morgan")
+            metrics[f"model/{strategy}/diversity"] = chem_evaluation.diversity(best_gen_set[strategy], "selfies", similarity_type="morgan")
+            metrics[f"model/{strategy}/TS"] = chem_evaluation.compute_average_tanimoto(list(all_texts_lists.keys()),best_gen_set[strategy], similarity_type="morgan")
+            metrics[f"model/{strategy}/JNK3"] = chem_evaluation.jnk3_score(best_gen_set[strategy],"selfies")
+            metrics[f"model/{strategy}/GSK3B"] = chem_evaluation.gsk3b_score(best_gen_set[strategy], "selfies")
+            metrics[f"model/{strategy}/SA"] = chem_evaluation.sa(best_gen_set[strategy], "selfies")
+            metrics[f"model/{strategy}/QED"] = chem_evaluation.qed(best_gen_set[strategy], "selfies")
+            metrics[f"model/{strategy}/SR"] = chem_evaluation.success_rate(best_gen_set[strategy], "selfies")
+
+        print(metrics)
+        accelerator.log(metrics, self.step)
+        torch.cuda.empty_cache() 
+        self.diffusion.to(device)
+        self.ema.to(device)
+
+    @torch.no_grad()
+    def multiobj_dpo_data(self, dpo_dataset, num_samples_per_multiobj=2, vec_free_guidance=1.0, using_vec_cond = False, seed=42):
+        accelerator = self.accelerator
+        device = accelerator.device
+        self.diffusion.to('cpu')   
+        torch.cuda.empty_cache()
+
+        self.ema.ema_model.eval()
+        multiobj_cond_lst = []
+        selfies_test_dataset = []
+        # multiobj_cond_lst.extend(dpo_dataset[:]["vec_cond"])
+        selfies_test_dataset.extend(dpo_dataset[:]["selfies"])
+        for i in range(len(selfies_test_dataset)):
+            multiobj_cond_lst.append(dpo_dataset[i]["vec_cond"])
+        print(len(multiobj_cond_lst), len(selfies_test_dataset))
+        num_samples = len(multiobj_cond_lst)
+        # num_samples = default(num_samples, self.num_samples)
+        gen_dpo_dataset = {}
+        all_texts_lists = {}
+        total_gen_selfies = {k:0 for k,_ in constant.generate_kwargs.items()}
+
+        torch.manual_seed(seed)
+        print(num_samples)
+        def get_vec_n(vec_cond, n):
+            if using_vec_cond:
+                return vec_cond.repeat(n,1).to(device)
+            else:
+                return None
+
+        for i in range(num_samples):
+            multiobj_exprs = multiobj_cond_lst[i]
+            multiobj_texts_lists = {k:[] for k,_ in constant.generate_kwargs.items()}
+            if all_texts_lists.get(selfies_test_dataset[i]) != None:
+                pass
+            else:
+                while min([len(multiobj_texts_lists[ele]) for ele in multiobj_texts_lists]) < num_samples_per_multiobj:
+                    batches = num_to_groups(num_samples_per_multiobj-min([len(multiobj_texts_lists[ele]) for ele in multiobj_texts_lists]), max(self.eval_batch_size,self.train_batch_size))
+                    model_outputs = list(map(lambda n: tuple(x.to('cpu') for x in self.ema.ema_model.sample(batch_size=n, length=None, vec_cond=get_vec_n(multiobj_exprs,n), vec_free_guidance=vec_free_guidance)), batches))
+                    for (latents, mask) in model_outputs:
+                        latents, mask = latents.to(device), mask.to(device)
+                        if self.args.normalize_latent:
+                            latents = self.ema.ema_model.unnormalize_latent(latents)
+                        for k, kwargs in constant.generate_kwargs.items():
+                            if self.latent_model_path:
+                                attention_mask = None
+                                if self.use_my_latent_model:
+                                    encoder_output = BaseModelOutput(last_hidden_state=self.rnet(latents.clone()))
+                                else:
+                                    encoder_output = BaseModelOutput(last_hidden_state=self.bart_model.get_decoder_input(latents.clone()))
+                            else:
+                                attention_mask = mask.clone()
+                                encoder_output = BaseModelOutput(last_hidden_state=latents.clone())
+                            if k=="beam":
+                                sample_ids = self.bart_model.generate(encoder_outputs=encoder_output, max_new_tokens = 1024)
+                            else:
+                                sample_ids = self.bart_model.generate(encoder_outputs=encoder_output, attention_mask=attention_mask, **kwargs)
+                            selfies_list = [self.tokenizer.decode(g, skip_special_tokens=True, clean_up_tokenization_spaces=True) for g in sample_ids]
+                            total_gen_selfies[k] += len(selfies_list)
+                            selfies_list = [selfie.strip() for selfie in selfies_list if len(selfie.strip())>0 and Chem.MolFromSmiles(sf.decoder(selfie)) != None]
+                            multiobj_texts_lists[k].extend(selfies_list)
+                    
+                assert min([len(multiobj_texts_lists[ele]) for ele in multiobj_texts_lists]) >= num_samples_per_multiobj
+                selfies_generations = {k:v[:num_samples_per_multiobj] for k,v in multiobj_texts_lists.items()}
+                all_texts_lists[selfies_test_dataset[i]] = selfies_generations
+        
+        for og_chem, gen_chem in all_texts_lists.items():
+            gen_mol = gen_chem['beam'] + gen_chem['nucleus']
+            gen_dpo_dataset[og_chem] = gen_mol
+        return gen_dpo_dataset
+
+    @torch.no_grad()
+    def sample(self, num_samples=None, class_id=None, vec_cond=None, seed=42, test=False, cls_free_guidance=1.0, vec_free_guidance=1.0):
+        num_samples = default(num_samples, self.num_samples)
+        accelerator = self.accelerator
+        device = accelerator.device
+        att_name = 'text' #change it to 'selfies' when your runnning this function
         self.diffusion.to('cpu')
         torch.cuda.empty_cache() 
 
@@ -853,21 +1442,21 @@ class Trainer(object):
             for filter_class_id in range(self.diffusion.diffusion_model.num_classes):
                 filtered_dataset = self.dataset.filter(lambda example: example["label"]==filter_class_id)
                 if test:
-                    reference_texts[f'ref{filter_class_id}_test'] = filtered_dataset['test']['text']
+                    reference_texts[f'ref{filter_class_id}_test'] = filtered_dataset['test'][att_name]
                     continue
-                reference_texts[f'ref{filter_class_id}_val'] = filtered_dataset['valid']['text']
-                reference_texts[f'ref{filter_class_id}_train'] = filtered_dataset['train']['text']
+                reference_texts[f'ref{filter_class_id}_val'] = filtered_dataset['valid'][att_name]
+                reference_texts[f'ref{filter_class_id}_train'] = filtered_dataset['train'][att_name]
             
             for key, reference_text in reference_texts.items():
                 num_samples = min(num_samples, len(reference_text))
             reference_texts = {k: v[:num_samples] for k, v in reference_texts.items()}
         else:
             if test:
-                reference_texts[f'test'] = self.dataset['test']['text'][:num_samples]
-                reference_texts['train'] = self.dataset['train']['text'][:num_samples]
+                reference_texts[f'test'] = self.dataset['test'][att_name][:num_samples]
+                reference_texts['train'] = self.dataset['train'][att_name][:num_samples]
             else:
-                reference_texts['val'] = self.dataset['valid']['text'][:num_samples]
-                reference_texts['train'] = self.dataset['train']['text'][:num_samples]
+                reference_texts['val'] = self.dataset['valid'][att_name][:num_samples]
+                reference_texts['train'] = self.dataset['train'][att_name][:num_samples]
 
         milestone = self.step // self.save_and_sample_every
         # Stores generation outputs for each strategy
@@ -885,7 +1474,7 @@ class Trainer(object):
         # Loop until enough senetences have been generated across all strategies 
         while min([len(all_texts_lists[ele]) for ele in all_texts_lists]) < num_samples:
             batches = num_to_groups(num_samples-min([len(all_texts_lists[ele]) for ele in all_texts_lists]), max(self.eval_batch_size,self.train_batch_size))
-            model_outputs = list(map(lambda n: tuple(x.to('cpu') for x in self.ema.ema_model.sample(batch_size=n, length=self.length_categorical.sample((n,)), class_id=get_class_id(n), cls_free_guidance=cls_free_guidance)), batches))
+            model_outputs = list(map(lambda n: tuple(x.to('cpu') for x in self.ema.ema_model.sample(batch_size=n, length=self.length_categorical.sample((n,)), class_id=get_class_id(n), cls_free_guidance=cls_free_guidance, )), batches))
             
             for (latents, mask) in model_outputs:
                 latents, mask = latents.to(device), mask.to(device)
@@ -918,7 +1507,7 @@ class Trainer(object):
             ngram_metrics = evaluation.compute_diversity(all_texts_list)
             for k, v in ngram_metrics.items():
                 metrics[f"model/{strategy}/{class_id_prefix}{k}"] = v
-            metrics[f"model/{strategy}/{class_id_prefix}memorization"] = evaluation.compute_memorization(all_texts_list, self.dataset['train']['text'])
+            metrics[f"model/{strategy}/{class_id_prefix}memorization"] = evaluation.compute_memorization(all_texts_list, self.dataset['train'][att_name])
             table = wandb.Table( 
                 columns=['Samples'], data=[[text] for text in all_texts_list])
             accelerator.log({f"model/{strategy}/{class_id_prefix}samples": table}, self.step)
@@ -951,6 +1540,7 @@ class Trainer(object):
         num_candidates = default(num_candidates, self.seq2seq_candidates)
         accelerator = self.accelerator
         device = accelerator.device
+        att_name = 'text' #change it to 'selfies' when your runnning this function
 
         self.ema.ema_model.eval()
 
@@ -1054,9 +1644,9 @@ class Trainer(object):
                 best_indices = np.argmax(mbr_sacrebleu_scores, axis=1)
                 best_predictions = [pred_texts[i*num_candidates + idx] for i, idx in enumerate(best_indices)]
                 if split == 'test':
-                    gt_reference_texts = self.dataset['test']['text'][:num_samples]
+                    gt_reference_texts = self.dataset['test'][att_name][:num_samples]
                 elif split == 'val':
-                    gt_reference_texts = self.dataset['valid']['text'][:num_samples]
+                    gt_reference_texts = self.dataset['valid'][att_name][:num_samples]
                 elif split == 'train':
                     gt_reference_texts = reference_texts[::num_candidates]
                 else:
@@ -1102,10 +1692,10 @@ class Trainer(object):
             tokenize = 'intl' if self.dataset_name == 'wmt14-en-de' else '13a'
             # Compute BLEU
             if split == 'test':
-                assert num_samples == len(self.dataset['test']['text'])
-                reference_texts = self.dataset['test']['text'][:num_samples]
+                assert num_samples == len(self.dataset['test'][att_name])
+                reference_texts = self.dataset['test'][att_name][:num_samples]
             elif split == 'val':
-                reference_texts = self.dataset['valid']['text'][:num_samples]
+                reference_texts = self.dataset['valid'][att_name][:num_samples]
             assert len(pred_texts) == len(reference_texts)
             sacrebleu_score = evaluation.compute_sacrebleu(pred_texts, reference_texts, tokenize=tokenize)
             metrics[f"model/seq2seq/{prefix}sacrebleu"] = sacrebleu_score
@@ -1135,34 +1725,34 @@ class Trainer(object):
             ngram_metrics = evaluation.compute_diversity(pred_texts)
             for k, v in ngram_metrics.items():
                 metrics[f"model/seq2seq/{prefix}{k}"] = v
-            metrics[f"model/seq2seq/{prefix}memorization"] = evaluation.compute_memorization(pred_texts, self.dataset['train']['text'])
+            metrics[f"model/seq2seq/{prefix}memorization"] = evaluation.compute_memorization(pred_texts, self.dataset['train'][att_name])
             metrics[f"model/seq2seq/{prefix}bertscore"] = evaluation.compute_bertscore(pred_texts, reference_texts)
         
         accelerator.log(metrics, self.step)
         print(metrics)
-        torch.cuda.empty_cache() 
+        torch.cuda.empty_cache()
 
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
-
+        # self.load(file_path="saved_diff_models/SELFormer-selfies/2024-09-25_07-07-16")
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
-
             while self.step < self.train_num_steps:
-
                 #TODO center and normalize BART latent space with empirical est. of mean/var.
-
                 total_loss = 0.
                 decoding_loss = 0.
                 for grad_accum_step in range(self.gradient_accumulate_every):
-                    data = next(self.data_iter).to(device)
+                    # data = next(self.data_iter).to(device)
+                    data = {k:v.to(device) if k!= "selfies" else v for k,v in next(self.data_iter).items()}
                     with torch.no_grad():
                         encoder_outputs = self.bart_model.get_encoder()(input_ids = data['input_ids'], attention_mask = data['attention_mask'])
                         if self.using_latent_model:
-                            latent = self.bart_model.get_diffusion_latent(encoder_outputs, data['attention_mask'])      
+                            if self.use_my_latent_model:
+                                latent = torch.squeeze(self.cnet(encoder_outputs[0]))
+                            else:
+                                latent = self.bart_model.get_diffusion_latent(encoder_outputs, data['attention_mask'])     
                         else:                      
                             latent = encoder_outputs.last_hidden_state
-                        
                         if self.args.normalize_latent:
                             if self.step==0 and grad_accum_step==0:
                                 if self.using_latent_model:
@@ -1179,16 +1769,17 @@ class Trainer(object):
 
                                 self.ema.ema_model.latent_scale = self.diffusion.latent_scale
                             latent = self.diffusion.normalize_latent(latent)
-                        
+                    
                     seq2seq_cond = None
                     seq2seq_mask = None
                     with accelerator.autocast():
                         if self.seq2seq and random.random() < (1-self.seq2seq_unconditional_prob):
                             if self.num_devices > 1:
-                                seq2seq_cond = self.diffusion.module.context_encoder(input_ids = data['cond_input_ids'], attention_mask = data['cond_attention_mask']).last_hidden_state.float()
+                                seq2seq_cond = self.diffusion.module.context_encoder(input_ids = data['input_ids'], attention_mask = data['attention_mask']).last_hidden_state.float()
                             else:
-                                seq2seq_cond = self.diffusion.context_encoder(input_ids = data['cond_input_ids'], attention_mask = data['cond_attention_mask']).last_hidden_state.float()
-                            seq2seq_mask = data['cond_attention_mask'].bool()
+                                seq2seq_cond = self.diffusion.context_encoder(input_ids = data['input_ids'], attention_mask = data['attention_mask']).last_hidden_state.float()
+                            # seq2seq_mask = data['cond_attention_mask'].bool()
+                            seq2seq_mask = data['attention_mask'].bool()
 
                     if self.using_latent_model:
                         mask = torch.ones(latent.shape[0], self.num_encoder_latents, dtype=torch.bool).to(device)
@@ -1197,7 +1788,7 @@ class Trainer(object):
                     if self.decoding_loss:
                         raise NotImplementedError
                     else:
-                        loss = self.diffusion(latent, mask, class_id=(data['label'] if self.class_conditional else None), seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask)
+                        loss ,_,_ = self.diffusion(latent, mask, tokenizer=self.tokenizer, class_id=(data['label'] if self.class_conditional else None), vec_cond = (data['vec_cond'] if self.vec_conditional else None), seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask)
                         loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
                     self.accelerator.backward(loss)                
@@ -1226,18 +1817,20 @@ class Trainer(object):
                     self.ema.update()
 
                     # Log to WandB
-                    if self.step % 50 == 0:
+                    if self.step % self.save_and_sample_every == 0:
                         self.diffusion.eval()
                         self.ema.ema_model.eval()
                         with torch.no_grad():
                             total_val_loss = 0.
                             total_val_ema_loss = 0.
                             for grad_accum_step in range(self.gradient_accumulate_every):
-                                data = next(self.val_iter).to(device)
-                                
+                                data = {k:v.to(device) if k!= "selfies" else v for k,v in next(self.val_iter).items()}
                                 encoder_outputs = self.bart_model.get_encoder()(input_ids = data['input_ids'], attention_mask = data['attention_mask'])
                                 if self.using_latent_model:
-                                    latent = self.bart_model.get_diffusion_latent(encoder_outputs, data['attention_mask'])      
+                                    if self.use_my_latent_model:
+                                        latent = torch.squeeze(self.cnet(encoder_outputs[0]))
+                                    else:
+                                        latent = self.bart_model.get_diffusion_latent(encoder_outputs, data['attention_mask'])      
                                 else:                      
                                     latent = encoder_outputs.last_hidden_state
                                 
@@ -1249,42 +1842,221 @@ class Trainer(object):
                                 if self.seq2seq and random.random() < (1-self.seq2seq_unconditional_prob):
                                     with torch.no_grad():
                                         if self.num_devices > 1:
-                                            seq2seq_cond = self.diffusion.module.context_encoder(input_ids = data['cond_input_ids'], attention_mask = data['cond_attention_mask']).last_hidden_state.float()
+                                            seq2seq_cond = self.diffusion.module.context_encoder(input_ids = data['input_ids'], attention_mask = data['attention_mask']).last_hidden_state.float()
                                         else:
-                                            seq2seq_cond = self.diffusion.context_encoder(input_ids = data['cond_input_ids'], attention_mask = data['cond_attention_mask']).last_hidden_state.float()
-                                    seq2seq_mask = data['cond_attention_mask'].bool()
+                                            seq2seq_cond = self.diffusion.context_encoder(input_ids = data['input_ids'], attention_mask = data['attention_mask']).last_hidden_state.float()
+                                    seq2seq_mask = data['attention_mask'].bool()
                                 
                                 if self.using_latent_model:
                                     mask = torch.ones((latent.shape[0], self.num_encoder_latents), dtype=torch.bool).to(device)
                                 else:
                                     mask = data['attention_mask'].bool()
-                                loss = self.diffusion(latent, mask, class_id=(data['label'] if self.class_conditional else None), seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask)
-                                loss = loss / self.gradient_accumulate_every
+                                loss, _, _ = self.diffusion(latent, mask, class_id=(data['label'] if self.class_conditional else None), vec_cond = (data['vec_cond'] if self.vec_conditional else None), seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask)
+                                loss = loss/ self.gradient_accumulate_every
                                 total_val_loss += loss.item()
-                                loss = self.ema.ema_model(latent, mask, class_id=(data['label'] if self.class_conditional else None), seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask)
-                                loss = loss / self.gradient_accumulate_every
+                                
+                                loss, _, _ = self.ema.ema_model(latent, mask, class_id=(data['label'] if self.class_conditional else None), vec_cond = (data['vec_cond'] if self.vec_conditional else None), seq2seq_cond=seq2seq_cond, seq2seq_mask=seq2seq_mask)
                                 total_val_ema_loss += loss.item()
 
                             logs["val_loss"] = total_val_loss 
                             logs["val_ema_loss"] = total_val_ema_loss
                             pbar.set_postfix(**logs)  
                         self.diffusion.train()
-                    accelerator.log(logs, step=self.step)              
+                    accelerator.log(logs, step=self.step) 
+
                     if self.step % self.save_and_sample_every == 0:
-                        if self.seq2seq:
-                            if 'wmt' in self.args.dataset_name:
-                                for guidance_strength in [1.0, 2.0]:
-                                    self.sample_seq2seq(cls_free_guidance=guidance_strength, incremental=False)
-                            else:
-                                self.sample_seq2seq()
-                            self.sample_seq2seq(split='train')
+                        if self.task == "phenotype" or self.task == "phenotype_clip":
+                            self.phenotype_drug_design(num_samples=self.num_samples,using_vec_cond = True, num_samples_per_gene=50)
                         else:
-                            self.sample()
-                        if self.class_conditional:
-                            for class_id in range(self.diffusion.diffusion_model.num_classes):
-                                self.sample(num_samples=100, class_id=class_id)
+                            self.multiobj_drug_design(num_samples=self.num_samples,using_vec_cond = True, num_samples_per_multiobj=100)
+                    if self.step % self.save_and_sample_every == 0:
                         self.save()
-                        
+                        self.diffusion.train() 
+                pbar.update(1)
+            accelerator.wait_for_everyone()
+        self.save()
+        accelerator.print('training complete')
+
+    def DPO_dataset(self, dpo_file_path, num_samples_per_multiobj):
+        dpo_dataset = []
+        with open(dpo_file_path,'r') as f:
+            for selfie in f:
+                selfie = selfie.strip()
+                try:
+                    sf.decoder(selfie)
+                    dpo_dataset.append(selfie)
+                except Exception as e:
+                    pass
+        
+        self.qed = Oracle(name = 'QED')
+        self.sa = Oracle(name = 'SA')
+        self.gsk3b = Oracle(name = 'GSK3B')
+        self.jnk3 = Oracle(name = 'JNK3')
+        basic_tokenizer = AutoTokenizer.from_pretrained("zjunlp/MolGen-large")
+        def shift_tokens_right(input_ids: torch.Tensor):
+            """
+            Shift input ids one token to the right.
+            """
+            pad_token_id = 1
+            decoder_start_token_id = 2
+            shifted_input_ids = torch.zeros_like(input_ids)
+            shifted_input_ids[:, 1:] = input_ids[:, :-1]
+            shifted_input_ids[:, 0] = decoder_start_token_id
+
+            if pad_token_id is None:
+                raise ValueError("self.model.config.pad_token_id has to be defined.")
+            shifted_input_ids.masked_fill_(shifted_input_ids == -100, pad_token_id)
+            return shifted_input_ids
+    
+        def diffusion_tokenize(example):
+            col_name = "selfies"
+            encoder_data = basic_tokenizer(example[col_name], padding="max_length", truncation = True, return_tensors = "pt")
+            vec_cond = torch.tensor([self.qed(sf.decoder(example[col_name][0])), 
+                                    self.sa(sf.decoder(example[col_name][0])), 
+                                    self.gsk3b(sf.decoder(example[col_name][0])), 
+                                    self.jnk3(sf.decoder(example[col_name][0]))]).unsqueeze(0).float()
+            
+            decoder_data = shift_tokens_right(encoder_data["input_ids"])
+            labels = torch.where(encoder_data['input_ids'] == 1, -100, encoder_data['input_ids'])
+            data = {**{"selfies":example[col_name]}, **encoder_data,"decoder_input_ids":decoder_data,**{"labels":labels},**{"vec_cond":vec_cond}}
+            return data
+        
+        dpo_dataset = datasets.Dataset.from_dict({"selfies":dpo_dataset})
+        dpo_dataset = dpo_dataset.with_transform(diffusion_tokenize)
+        self.load(file_path="saved_diff_models/SELFormer-selfies/2024-07-21_16-00-57")
+        dpo_dataset = self.multiobj_dpo_data(dpo_dataset, using_vec_cond = True, num_samples_per_multiobj=num_samples_per_multiobj)
+
+        with open(dpo_file_path,'w') as f:
+            for og_chem, gen_chems in dpo_dataset.items():
+                for gen_chem in gen_chems:
+                    f.write(f"{og_chem},{gen_chem}\n")
+
+    def dpo_train(self, beta):
+        accelerator = self.accelerator
+        device = accelerator.device
+        if not os.path.exists('datasets/dpo_train_data.txt') and not os.path.exists('datasets/dpo_train_data.txt'):
+            self.DPO_dataset('datasets/dpo_train_data.txt',5)
+            self.DPO_dataset('datasets/dpo_test_data.txt',5)
+        data = torch.load("saved_diff_models/SELFormer-selfies/2024-09-12_19-18-44/model.pt", map_location=device)
+        self.ema.load_state_dict(data['ema'])
+        for param in self.ema.ema_model.parameters():
+            param.requires_grad = False
+
+        self.dpo_diffusion = copy.deepcopy(self.ema.ema_model)
+        for param in self.dpo_diffusion.parameters():
+            param.requires_grad = True
+        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+            while self.step < self.train_num_steps:
+                #TODO center and normalize BART latent space with empirical est. of mean/var.
+                total_loss = 0.
+                for grad_accum_step in range(self.gradient_accumulate_every):
+                    data = {k:v.to(device) if k!= "selfies_w" and k!= "selfies_l" else v for k,v in next(self.data_iter).items()}
+                    with torch.no_grad():
+                        encoder_outputs_w = self.bart_model.get_encoder()(input_ids = data['input_ids_w'], attention_mask = data['attention_mask_w'])
+                        encoder_outputs_l = self.bart_model.get_encoder()(input_ids = data['input_ids_l'], attention_mask = data['attention_mask_l'])
+                        if self.using_latent_model:
+                            if self.use_my_latent_model:
+                                latent_w = torch.squeeze(self.cnet(encoder_outputs_w[0]))
+                                latent_l = torch.squeeze(self.cnet(encoder_outputs_l[0]))
+                            else:
+                                latent_w = self.bart_model.get_diffusion_latent(encoder_outputs_w, data['attention_mask_w'])
+                                latent_l = self.bart_model.get_diffusion_latent(encoder_outputs_l, data['attention_mask_l'])       
+                        else:                      
+                            latent_w = encoder_outputs_w.last_hidden_state
+                            latent_l = encoder_outputs_l.last_hidden_state
+                        if self.args.normalize_latent:
+                            if self.step==0 and grad_accum_step==0:
+                                if self.using_latent_model:
+                                    latent_vecs_w = rearrange(latent_w, 'b s d -> (b s) d')
+                                    latent_vecs_l = rearrange(latent_l, 'b s d -> (b s) d')
+                                else:
+                                    latent_vecs_w = torch.cat([latent_w[i][:torch.sum(data['attention_mask_w'][i])] for i in range(latent_w.shape[0])], dim=0)
+                                    latent_vecs_l = torch.cat([latent_l[i][:torch.sum(data['attention_mask_l'][i])] for i in range(latent_l.shape[0])], dim=0)
+                                
+                                # Add mean stats to model and EMA wrapper
+                                self.diffusion.latent_mean = torch.mean(latent_vecs_w, dim=0)
+                                self.ema.ema_model.latent_mean = self.diffusion.latent_mean
+
+                                # Add var stats to model and EMA wrapper
+                                self.diffusion.latent_scale = torch.std(latent_vecs_w-self.diffusion.latent_mean, unbiased=False)
+
+                                self.diffusion.latent_mean = torch.mean(latent_vecs_l, dim=0)
+                                self.ema.ema_model.latent_mean = self.diffusion.latent_mean
+
+                                # Add var stats to model and EMA wrapper
+                                self.diffusion.latent_scale = torch.std(latent_vecs_l-self.diffusion.latent_mean, unbiased=False)
+
+                                self.ema.ema_model.latent_scale = self.diffusion.latent_scale
+                            latent_w = self.diffusion.normalize_latent(latent_w)
+                            latent_l = self.diffusion.normalize_latent(latent_l)
+                    
+                    seq2seq_cond_w = None
+                    seq2seq_mask_w = None
+                    seq2seq_cond_l = None
+                    seq2seq_mask_l = None
+                    with accelerator.autocast():
+                        if self.seq2seq and random.random() < (1-self.seq2seq_unconditional_prob):
+                            if self.num_devices > 1:
+                                # seq2seq_cond = self.diffusion.module.context_encoder(input_ids = data['cond_input_ids'], attention_mask = data['cond_attention_mask']).last_hidden_state.float()
+                                seq2seq_cond_w = self.diffusion.module.context_encoder(input_ids = data['input_ids_w'], attention_mask = data['attention_mask_w']).last_hidden_state.float()
+                                seq2seq_cond_l = self.diffusion.module.context_encoder(input_ids = data['input_ids_l'], attention_mask = data['attention_mask_l']).last_hidden_state.float()
+                            else:
+                                # seq2seq_cond = self.diffusion.context_encoder(input_ids = data['cond_input_ids'], attention_mask = data['cond_attention_mask']).last_hidden_state.float()
+                                seq2seq_cond_w = self.diffusion.context_encoder(input_ids = data['input_ids_w'], attention_mask = data['attention_mask_w']).last_hidden_state.float()
+                                seq2seq_cond_l = self.diffusion.context_encoder(input_ids = data['input_ids_l'], attention_mask = data['attention_mask_l']).last_hidden_state.float()
+                            # seq2seq_mask = data['cond_attention_mask'].bool()
+                            seq2seq_mask_w = data['attention_mask_w'].bool()
+                            seq2seq_mask_l = data['attention_mask_l'].bool()
+
+                    if self.using_latent_model:
+                        mask_w = torch.ones(latent_w.shape[0], self.num_encoder_latents, dtype=torch.bool).to(device)
+                        mask_l = torch.ones(latent_l.shape[0], self.num_encoder_latents, dtype=torch.bool).to(device)
+                    else:
+                        mask_w = data['attention_mask_w'].bool()
+                        mask_l = data['attention_mask_l'].bool()
+                    if self.decoding_loss:
+                        raise NotImplementedError
+                    else:
+                        loss = self.diffusion.dpo_loss(latent_w,latent_l,
+                                                       mask_w,mask_l, 
+                                                       self.dpo_diffusion.diffusion_model, self.ema.ema_model.diffusion_model,
+                                                       class_id=(data['label'] if self.class_conditional else None), vec_cond = (data['vec_cond'] if self.vec_conditional else None),
+                                                       beta=beta,
+                                                       seq2seq_cond_w=seq2seq_cond_w, seq2seq_cond_l=seq2seq_cond_l,
+                                                       seq2seq_mask_w=seq2seq_mask_w,seq2seq_mask_l=seq2seq_mask_l,
+                                                       )
+                         
+                        loss = loss / self.gradient_accumulate_every
+                        total_loss += loss.item()
+                    self.accelerator.backward(loss)                
+
+                accelerator.clip_grad_norm_(self.dpo_diffusion.parameters(), self.args.clip_grad_norm)
+                grad_norm = compute_grad_norm(self.dpo_diffusion.parameters())
+                accelerator.wait_for_everyone()
+                self.opt.step()
+                self.lr_scheduler.step()
+                self.opt.zero_grad()
+                accelerator.wait_for_everyone()
+
+                self.step += 1
+                if accelerator.is_main_process:
+                    logs = {
+                        "loss": total_loss,
+                        "learning_rate": self.lr_scheduler.get_last_lr()[0],
+                        "grad_norm": grad_norm,
+                        "step": self.step, 
+                        "epoch": (self.step*self.gradient_accumulate_every)/len(self.dataloader), 
+                        "samples": self.step*self.train_batch_size*self.gradient_accumulate_every*self.num_devices
+                    }
+                    self.ema.to(device)
+                    self.ema.update()
+                
+                    accelerator.log(logs, step=self.step) 
+
+                    if self.step % self.save_and_sample_every == 0:
+                    # if self.step % 1 == 0:    
+                        self.multiobj_drug_design(num_samples=self.num_samples,using_vec_cond = True, num_samples_per_multiobj=50, dpo_training=True)
+                        self.save()
                         self.diffusion.train() 
                 pbar.update(1)
             accelerator.wait_for_everyone()

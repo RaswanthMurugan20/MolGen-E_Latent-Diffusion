@@ -7,17 +7,17 @@ import CONSTANTS as CONSTANTS
 
 from latent_models.bart_latent_model import BARTForConditionalGenerationLatent
 from latent_models.t5_latent_model import T5ForConditionalGenerationLatent, MT5ForConditionalGenerationLatent
-
-
+import sys
 
 def get_latent_model(args):
-    if 'bart' in args.enc_dec_model:
+    if 'bart' or 'MolGen' in args.enc_dec_model:
         config = BartForConditionalGeneration.from_pretrained(
             args.enc_dec_model).config
         lm = BARTForConditionalGenerationLatent.from_pretrained(
             args.enc_dec_model, config=config, num_encoder_latents=args.num_encoder_latents, num_decoder_latents=args.num_decoder_latents, dim_ae=args.dim_ae, num_layers=args.num_layers, l2_normalize_latents=args.l2_normalize_latents, _fast_init=False)
         tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
             args.enc_dec_model)
+
     elif 't5' in args.enc_dec_model:
         if 'mt5' in args.enc_dec_model:
             config = MT5ForConditionalGeneration.from_pretrained(

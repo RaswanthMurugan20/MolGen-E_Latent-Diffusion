@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
-
+import sys
 
 from einops import rearrange, reduce, repeat
 
@@ -210,7 +210,6 @@ class PerceiverResampler(nn.Module):
 
     def forward(self, x, mask=None):
         pos_emb = self.pos_emb(x)
-
         x_with_pos = x + pos_emb
 
         latents = repeat(self.latents, 'n d -> b n d', b=x.shape[0])
@@ -239,7 +238,6 @@ class Transformer(nn.Module):
         self.pos_emb = AbsolutePositionalEmbedding(dim_tx, max_seq_len)
 
         self.input_proj = nn.Linear(dim_input, dim_tx)
-
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
@@ -255,6 +253,7 @@ class Transformer(nn.Module):
         
         assert not exists(mask)
         x = self.input_proj(x)
+
         pos_emb = self.pos_emb(x)
         x = x + pos_emb
 
@@ -275,7 +274,7 @@ class PerceiverAutoEncoder(nn.Module):
         dim_head=64,
         num_encoder_latents=8,
         num_decoder_latents=32,
-        max_seq_len=64,
+        max_seq_len=1024,
         ff_mult=4,
         encoder_only=False,
         transformer_decoder=False,
