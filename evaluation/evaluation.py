@@ -9,6 +9,7 @@ import numpy as np
 import wandb
 
 def compute_perplexity(all_texts_list, model_id='gpt2-large'):
+    model_id= 'zjunlp/MolGen-large'
     torch.cuda.empty_cache() 
     perplexity = load("perplexity", module_type="metric")
     results = perplexity.compute(predictions=all_texts_list, model_id=model_id, device='cuda')

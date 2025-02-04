@@ -7,13 +7,13 @@ from collections import namedtuple, Counter
 from multiprocessing import cpu_count
 import os
 import numpy as np
-from sklearn.metrics import f1_score, accuracy_score
 from contextlib import nullcontext
 import json
-
+from datasets import load_dataset
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
+import sys
 
 import timeit
 
@@ -33,14 +33,14 @@ import wandb
 import CONSTANTS as CONSTANTS
 import diffusion.optimizer as optimizer
 import dataset_utils.text_dataset as text_dataset
+from dataset_utils.chem_dataset import MultiObjective
 from utils.torch_utils import compute_grad_norm
 import utils.file_utils as file_utils
-from evaluation import evaluation
+from evaluation import evaluation, chem_evaluation
 
 from latent_models.bart_latent_model import BARTForConditionalGenerationLatent
 from latent_models.t5_latent_model import T5ForConditionalGenerationLatent
 from latent_models.latent_utils import get_latent_model
-
 
 generate_kwargs = {
     'beam': 
@@ -86,8 +86,8 @@ class Trainer(object):
         args,
         dataset_name,
         *,
-        train_batch_size = 16,
-        eval_batch_size = 64,
+        train_batch_size = 1,
+        eval_batch_size = 1,
         train_lr = 1e-4,
         train_num_steps = 100000,
         lr_schedule = 'cosine',
@@ -110,13 +110,14 @@ class Trainer(object):
         self.best_val_metric = 0
         self.num_samples = num_samples
 
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
 
         self.accelerator = Accelerator(
             mixed_precision = mixed_precision,
             log_with='wandb',
             kwargs_handlers=[ddp_kwargs]
         )
+
         self.num_devices = self.accelerator.num_processes
         args.num_devices = self.num_devices
 
@@ -128,9 +129,9 @@ class Trainer(object):
                 json.dump(args.__dict__, f, indent=2)
             run = os.path.split(__file__)[-1].split(".")[0]
             if args.wandb_name:
-                self.accelerator.init_trackers(run, config=args, init_kwargs={"wandb": {"dir": results_folder, "name": args.wandb_name}})
+                self.accelerator.init_trackers(run, config=args, init_kwargs={"wandb": {"dir": results_folder, "name": args.wandb_name, "entity": "raswanth"}})
             else:
-                self.accelerator.init_trackers(run, config=args, init_kwargs={"wandb": {"dir": results_folder}})
+                self.accelerator.init_trackers(run, config=args, init_kwargs={"wandb": {"dir": results_folder, "entity": "raswanth"}})
 
         self.enc_dec_model = args.enc_dec_model
 
@@ -140,21 +141,20 @@ class Trainer(object):
             self.accelerator.print(f'num trainable params: {num_trainable_params}')
 
         self.eval_every = eval_every
-
         self.train_batch_size = train_batch_size
         self.eval_batch_size = eval_batch_size
 
         self.train_num_steps = train_num_steps
 
         # dataset and dataloader
-        self.dataset = text_dataset.get_dataset(
-            dataset_name,
-        )
+        # self.dataset = text_dataset.get_dataset(
+        #     dataset_name,
+        # )
 
+        data = MultiObjective(dataset_path = '/raid/home/raswanth/multiobj-rationale/data/chembl/all.txt')
+        self.dataloader, self.val_dataloader, _, self.dataset = data.multiobj_dataset(train_batch_sze = train_batch_size, val_batch_sze = eval_batch_size,test_batch_sze = eval_batch_size, task = "encoder_training")
         if args.eval:
             self.dataset['train'] = self.dataset['train'].select(range(1000))
-        self.dataloader = text_dataset.get_dataloader(args, self.dataset['train'], config, self.tokenizer, args.max_seq_len, context_tokenizer=self.tokenizer)
-        self.val_dataloader = text_dataset.get_dataloader(args, self.dataset['valid'], config, self.tokenizer, args.max_seq_len, shuffle=False, context_tokenizer=self.tokenizer)
         self.max_seq_len = args.max_seq_len
 
         # optimizer
@@ -224,28 +224,68 @@ class Trainer(object):
             for _ in range(self.step):
                 self.lr_scheduler.step()
 
+    def save_embeddings(self, file_path):
+        file_path = Path(file_path)
+        accelerator = self.accelerator
+        device = accelerator.device
+        data = torch.load(str(file_path / f'model.pt'), map_location=device)
+        model = self.accelerator.unwrap_model(self.lm)
+        model.load_state_dict(data['model'])
+        model.eval()
+        device = self.accelerator.device
+        # device = "cuda"
+        clip_data = {
+            "selfies":[],
+            "embeds":[]
+        }
+        for batch in tqdm(self.dataloader):
+            data = {k:v.to(device) if k!= "selfies" else v for k,v in batch.items()}
+            # Compute generated language
+            if self.num_devices > 1:
+                encoder_outputs = model.module.get_encoder()(input_ids = data['input_ids'], attention_mask = data['attention_mask'])
+                encoder_outputs = model.module.get_diffusion_latent(encoder_outputs, data['attention_mask'])
+                encoder_outputs = encoder_outputs.reshape(encoder_outputs.shape[0],-1)
+            else:
+                print(data['input_ids'].device,data['attention_mask'].device)
+                encoder_outputs = model.get_encoder()(input_ids = data['input_ids'], attention_mask = data['attention_mask'])
+                encoder_outputs = model.get_diffusion_latent(encoder_outputs, data['attention_mask'])
+                encoder_outputs = encoder_outputs.reshape(encoder_outputs.shape[0],-1)
+            
+            clip_data["selfies"] += data["selfies"]
+            clip_data["embeds"] += [encoder_outputs[i] for i in range(encoder_outputs.shape[0])]
+            break
+        torch.save(clip_data, "results/clip_data.pt")
     
-    def validation(self):
+    def validation(self, file_path = None):
         self.lm.eval()
         pred_text = {k:[] for k,_ in generate_kwargs.items()}    
         bart_text = {k:[] for k,_ in generate_kwargs.items()}    
         ref_text = []
         accelerator = self.accelerator
         device = self.accelerator.device
+
+        if exists(file_path):
+            # data = torch.load(str(file_path / f'model.pt'), map_location=device)
+            data = torch.load(str(file_path + '/' + f'model.pt'), map_location=device)
+            self.lm = self.accelerator.unwrap_model(self.lm)
+            self.lm.load_state_dict(data['model'])
+
         for batch in tqdm(self.val_dataloader):
             for strategy in generate_kwargs.keys():
                 gen_kwargs = generate_kwargs[strategy]
                 gen_kwargs['max_length'] = self.max_seq_len
-                data = {k:v.to(device) for k,v in batch.items()}
+                data = {k:v.to(device) if k!= "selfies" else v for k,v in batch.items()}
                 # Compute generated language
                 if self.num_devices > 1:
                     encoder_outputs = self.lm.module.get_encoder()(input_ids = data['input_ids'], attention_mask = data['attention_mask'])
                     encoder_outputs = self.lm.module.encoder_output_to_decoder_input(encoder_outputs, data['attention_mask'])
-                    sample_ids = self.lm.module.generate(encoder_outputs=encoder_outputs, **gen_kwargs)
+                    # sample_ids = self.lm.module.generate(encoder_outputs=encoder_outputs, **gen_kwargs)
+                    sample_ids = self.lm.module.generate(encoder_outputs=encoder_outputs,max_new_tokens = 1024)
                 else:
                     encoder_outputs = self.lm.get_encoder()(input_ids = data['input_ids'], attention_mask = data['attention_mask'])
                     encoder_outputs = self.lm.encoder_output_to_decoder_input(encoder_outputs, data['attention_mask'])
-                    sample_ids = self.lm.generate(encoder_outputs=encoder_outputs, **gen_kwargs)
+                    # sample_ids = self.lm.generate(encoder_outputs=encoder_outputs, **gen_kwargs)
+                    sample_ids = self.lm.generate(encoder_outputs=encoder_outputs,max_new_tokens = 1024)
                 # Pad sample_ids to max_seq_len
                 sample_ids = F.pad(sample_ids, (0, self.max_seq_len - sample_ids.shape[-1]), value=self.tokenizer.pad_token_id)
                 gathered_sample_ids = accelerator.gather(sample_ids).to('cpu')
@@ -275,24 +315,24 @@ class Trainer(object):
         metrics = {}
         for strategy in generate_kwargs.keys():
             # Compute BLEU score
-            metrics[f'autoencoder/{strategy}/bleu'] = evaluation.compute_bleu(pred_text[strategy], ref_text)
-            metrics[f'bart/{strategy}/bleu'] = evaluation.compute_bleu(bart_text[strategy], ref_text)
-            # Compute perplexity
+            metrics[f'autoencoder/{strategy}/tanimoto'] = chem_evaluation.Tanimoto_Similarity(pred_text[strategy],ref_text)
+        #     metrics[f'autoencoder/{strategy}/bleu'] = evaluation.compute_bleu(pred_text[strategy], ref_text)
+        #     metrics[f'bart/{strategy}/bleu'] = evaluation.compute_bleu(bart_text[strategy], ref_text)
+        #     # Compute perplexity
 
-            if all(pred_text[strategy]):
-                metrics[f'autoencoder/{strategy}/perplexity'] = evaluation.compute_perplexity(pred_text[strategy])
+        #     if all(pred_text[strategy]):
+        #         metrics[f'autoencoder/{strategy}/perplexity'] = evaluation.compute_perplexity(pred_text[strategy])
 
-            if all(bart_text[strategy]):
-                metrics[f'bart/{strategy}/perplexity'] = evaluation.compute_perplexity(bart_text[strategy])
+        #     if all(bart_text[strategy]):
+        #         metrics[f'bart/{strategy}/perplexity'] = evaluation.compute_perplexity(bart_text[strategy])
 
-            rouge_metrics = evaluation.compute_rouge(pred_text[strategy], ref_text)
-            for k,v in rouge_metrics.items():
-                metrics[f'autoencoder/{strategy}/{k}'] = v
-            rouge_metrics = evaluation.compute_rouge(bart_text[strategy], ref_text)
-            for k,v in rouge_metrics.items():
-                metrics[f'bart/{strategy}/{k}'] = v
-        metrics['reference/perplexity'] = evaluation.compute_perplexity(ref_text)
-         
+        #     rouge_metrics = evaluation.compute_rouge(pred_text[strategy], ref_text)
+        #     for k,v in rouge_metrics.items():
+        #         metrics[f'autoencoder/{strategy}/{k}'] = v
+        #     rouge_metrics = evaluation.compute_rouge(bart_text[strategy], ref_text)
+        #     for k,v in rouge_metrics.items():
+        #         metrics[f'bart/{strategy}/{k}'] = v
+        # metrics['reference/perplexity'] = evaluation.compute_perplexity(ref_text)
 
         accelerator.log(metrics, self.step)
 
@@ -318,16 +358,15 @@ class Trainer(object):
         self.lm.train()
         if self.args.lm_mode == 'freeze':
             encoder_context = torch.no_grad()
-        else:
+        else: 
             encoder_context = nullcontext()
 
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
 
             while self.step < self.train_num_steps:
 
-                total_loss = 0.
-
-                data = {k:v.to(device) for k,v in next(self.data_iter).items()}
+                total_loss = 0
+                data = {k:v.to(device) if k!= "selfies" else v for k,v in next(self.data_iter).items()}
 
                 with accelerator.autocast():
                     with encoder_context:
@@ -340,7 +379,8 @@ class Trainer(object):
                     else:
                         encoder_outputs = self.lm.encoder_output_to_decoder_input(encoder_outputs, data['attention_mask'])
 
-                    loss = self.lm(labels=data['labels'], encoder_outputs=encoder_outputs).loss     
+                    loss = self.lm(labels=data['labels'], encoder_outputs=encoder_outputs).loss
+                    
                 total_loss += loss.item()
 
                 self.accelerator.backward(loss)
@@ -365,7 +405,7 @@ class Trainer(object):
                     with torch.no_grad():
                         total_val_loss = 0.
                         total_lm_val_loss = 0.
-                        data = {k:v.to(device) for k,v in next(self.val_iter).items()}
+                        data = {k:v.to(device) if k!= "selfies" else v for k,v in next(self.val_iter).items()}
 
                         if self.num_devices > 1:
                             encoder_outputs = self.lm.module.get_encoder()(input_ids = data['input_ids'], attention_mask = data['attention_mask'])
@@ -398,6 +438,7 @@ class Trainer(object):
 
                 pbar.update(1)
         self.validation()
+        sys.exit()
         self.save()
 
         accelerator.print('training complete')
