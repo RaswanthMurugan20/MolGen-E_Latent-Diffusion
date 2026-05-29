@@ -1,54 +1,39 @@
-import math
-import copy
-from pathlib import Path
-import random 
-from functools import partial
-from collections import namedtuple, Counter
-from multiprocessing import cpu_count
+"""
+Stage-1 trainer: the molecule compression autoencoder.
+
+Trains the Perceiver autoencoder that compresses a MolGen-encoded SELFIES sequence into a
+small latent and decompresses it back, optimising for reconstruction with the underlying
+language model frozen. The resulting latent space is what the Stage-2 diffusion model
+operates in. Driven by ``train_latent_model.py``.
+"""
+
 import os
-import numpy as np
-from contextlib import nullcontext
 import json
-from datasets import load_dataset
+import random
+from pathlib import Path
+from contextlib import nullcontext
+
 import torch
-from torch import nn, einsum
 import torch.nn.functional as F
-import sys
-
-import timeit
-
-from einops import rearrange, reduce, repeat
-
-from PIL import Image
 from tqdm.auto import tqdm
 
-from transformers import get_scheduler, AutoTokenizer, PreTrainedTokenizerBase, T5ForConditionalGeneration, AutoModelForCausalLM
-from transformers.modeling_outputs import BaseModelOutput
-from transformers.models.bart.modeling_bart import BartForConditionalGeneration
-from datasets import concatenate_datasets
-
+from transformers import get_scheduler
 from accelerate import Accelerator, DistributedDataParallelKwargs
 import wandb
 
-import CONSTANTS as CONSTANTS
 import diffusion.optimizer as optimizer
-import dataset_utils.text_dataset as text_dataset
 from dataset_utils.chem_dataset import MultiObjective
 from utils.torch_utils import compute_grad_norm
 import utils.file_utils as file_utils
-from evaluation import evaluation, chem_evaluation
-
-from latent_models.bart_latent_model import BARTForConditionalGenerationLatent
-from latent_models.t5_latent_model import T5ForConditionalGenerationLatent
+from evaluation import chem_evaluation
 from latent_models.latent_utils import get_latent_model
 
+# Decoding strategies used during validation: deterministic beam search and nucleus sampling.
 generate_kwargs = {
-    'beam': 
+    'beam':
     {'max_length':64, 'min_length':5, 'do_sample':False, 'num_beams':4, 'no_repeat_ngram_size':3, 'repetition_penalty':1.2},
     'nucleus':
     {'max_length':64, 'min_length':5, 'do_sample':True, 'top_p':.95, 'num_beams':1, 'no_repeat_ngram_size':3, 'repetition_penalty':1.2}}
-
-ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 
 # helpers functions
 
@@ -81,6 +66,18 @@ def set_seeds(seed):
 # trainer class
 
 class Trainer(object):
+    """Trains and evaluates the molecule compression autoencoder.
+
+    The training loop encodes SELFIES with the (frozen) MolGen language model, compresses to
+    a latent and decompresses back via the Perceiver autoencoder, and optimises the
+    reconstruction loss. ``validation`` decodes held-out molecules and reports Tanimoto
+    similarity to the inputs; ``save`` / ``load`` checkpoint the model.
+
+    Note: where the code branches on ``self.num_devices > 1`` it is unwrapping the
+    DistributedDataParallel module (``self.lm.module``) for multi-GPU runs versus using the
+    plain model on a single device.
+    """
+
     def __init__(
         self,
         args,
@@ -129,9 +126,9 @@ class Trainer(object):
                 json.dump(args.__dict__, f, indent=2)
             run = os.path.split(__file__)[-1].split(".")[0]
             if args.wandb_name:
-                self.accelerator.init_trackers(run, config=args, init_kwargs={"wandb": {"dir": results_folder, "name": args.wandb_name, "entity": "raswanth"}})
+                self.accelerator.init_trackers(run, config=args, init_kwargs={"wandb": {"dir": results_folder, "name": args.wandb_name, "entity": args.wandb_entity}})
             else:
-                self.accelerator.init_trackers(run, config=args, init_kwargs={"wandb": {"dir": results_folder, "entity": "raswanth"}})
+                self.accelerator.init_trackers(run, config=args, init_kwargs={"wandb": {"dir": results_folder, "entity": args.wandb_entity}})
 
         self.enc_dec_model = args.enc_dec_model
 
@@ -151,7 +148,7 @@ class Trainer(object):
         #     dataset_name,
         # )
 
-        data = MultiObjective(dataset_path = '/raid/home/raswanth/multiobj-rationale/data/chembl/all.txt')
+        data = MultiObjective(dataset_path = 'datasets/Multi-Obj-Dataset')
         self.dataloader, self.val_dataloader, _, self.dataset = data.multiobj_dataset(train_batch_sze = train_batch_size, val_batch_sze = eval_batch_size,test_batch_sze = eval_batch_size, task = "encoder_training")
         if args.eval:
             self.dataset['train'] = self.dataset['train'].select(range(1000))
@@ -438,7 +435,6 @@ class Trainer(object):
 
                 pbar.update(1)
         self.validation()
-        sys.exit()
         self.save()
 
         accelerator.print('training complete')

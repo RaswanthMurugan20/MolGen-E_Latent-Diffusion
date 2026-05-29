@@ -1,24 +1,42 @@
-import argparse
-from utils import file_utils
-from transformers import AutoConfig
-import json
-import os
-import numpy as np
-import torch
+"""
+Stage 2 entry point — train the conditional latent diffusion model.
 
-import CONSTANTS
+Runs Gaussian diffusion in the latent space learned by the Stage-1 autoencoder
+(``train_latent_model.py``, supplied here via ``--latent_model_path``). Given a conditioning
+vector — gene expression (``--task phenotype``), gene CLIP embeddings
+(``--task phenotype_clip``), or a multi-objective property vector
+(``--task multi-objective``) — the diffusion model denoises a molecule latent, which is then
+decoded back into a SELFIES string. Also hosts the optional Diffusion-DPO fine-tuning
+(``--task dpo_training``).
+
+See ``scripts/diffusion/bart_latent_v-pred.sh`` for an example invocation.
+"""
+
+import os
+import json
+import argparse
+
+from transformers import AutoConfig
+
 from diffusion.text_denoising_diffusion import GaussianDiffusion, Trainer
 from model.diffusion_transformer import DiffusionTransformer
-import os
 
-ATTN_HEAD_DIM=64
+# Each attention head has a fixed dimension; the number of heads is tx_dim // ATTN_HEAD_DIM.
+ATTN_HEAD_DIM = 64
+
 
 def get_diffusion_latent_dims(args):
-    if args.latent_model_path is None: # 1. add the path of the latentdiff
+    """Return (latent_dim, lm_dim) for building the diffusion transformer.
+
+    latent_dim is the per-token width of the diffusion latent; lm_dim is the hidden size of
+    the language model providing the conditioning context. When a trained autoencoder is
+    given, both are read from its saved ``args.json``; otherwise they fall back to the
+    encoder-decoder model's config.
+    """
+    if args.latent_model_path is None:
         config = AutoConfig.from_pretrained(args.enc_dec_model)
         latent_dim = 64
         lm_dim = config.d_model
-        # config.d_model
     else:
         with open(os.path.join(args.latent_model_path, 'args.json'), 'rt') as f:
             latent_model_args = json.load(f)
@@ -144,6 +162,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode",type=str,default="phenotype")
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--wandb_name", type=str, default="roc_latent_v")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="W&B entity/team. Defaults to your default wandb account.")
     parser.add_argument("--beta",type=float,default=5000)
     # Optimization hyperparameters
     parser.add_argument("--optimizer", type=str, default="adamw")
@@ -248,7 +267,12 @@ if __name__ == "__main__":
     parser.add_argument("--eval_test", action="store_true", default=False)
     parser.add_argument("--resume_training", action="store_true", default=False)
     parser.add_argument("--resume_dir", type=str, default=None)
-    parser.add_argument("--latent_model_path", type=str, default="saved_latent_models/SELFormer-selfies/2024-07-16_01-53-07/")
+    parser.add_argument("--latent_model_path", type=str, default=None, help="Path to a trained latent autoencoder dir (containing args.json and model.pth). Required for latent diffusion.")
+    # Gene-expression conditioning data (phenotype tasks). Not bundled with the repo.
+    parser.add_argument("--gene_train_path", type=str, nargs="+", default=None, help="Train CSV(s) of paired SMILES + gene expression (phenotype task).")
+    parser.add_argument("--gene_val_path", type=str, default=None, help="Validation gene-expression file (phenotype task).")
+    parser.add_argument("--gene_test_path", type=str, default=None, help="Test gene-expression file (phenotype task).")
+    parser.add_argument("--gene_clip_path", type=str, default=None, help="Gene CLIP embeddings file (phenotype_clip task).")
     parser.add_argument("--init_path", type=str, default=None)
     parser.add_argument("--vector_conditional", action="store_true", default=True)
     parser.add_argument("--condition_dim",type=int, default=4)

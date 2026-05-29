@@ -148,7 +148,7 @@ class Phenotype:
 # MULTI-OBJECTIVE DIRUG DISCOVERY
 
 class MultiObjective:
-    def __init__(self, dataset_path = 'datasets'):
+    def __init__(self, dataset_path = 'datasets/Multi-Obj-Dataset'):
         raw_data = []
         self.basic_tokenizer = AutoTokenizer.from_pretrained("zjunlp/MolGen-large")
         self.qed = Oracle(name = 'QED')
@@ -232,10 +232,10 @@ class DPO:
         self.gsk3b = Oracle(name = 'GSK3B')
         self.jnk3 = Oracle(name = 'JNK3')
 
-        train_path = 'datasets/dpo_train_data.txt'
+        train_path = 'datasets/Multi-Obj-Dataset/dpo_train_data.txt'
         train_dataset_w = []
         train_dataset_l = []
-        test_path = 'datasets/dpo_test_data.txt'
+        test_path = 'datasets/Multi-Obj-Dataset/dpo_test_data.txt'
         test_dataset_w = []
         test_dataset_l = []
 

@@ -1,16 +1,23 @@
-import numpy as np
+"""
+Stage 1 entry point — train the molecule compression autoencoder.
 
-import torch.nn.functional as F
-import torch
+Learns the latent space the diffusion model (Stage 2) operates in: a SELFIES string is
+encoded by a frozen MolGen (BART) language model, compressed to a small latent by a
+Perceiver autoencoder, then decompressed and decoded back to SELFIES. Only the autoencoder
+is trained (the language model is frozen); the objective is reconstruction.
+
+The trained checkpoint is written to ``<save_dir>/<dataset>/<timestamp>/`` and is later
+passed to ``train_text_diffusion.py`` via ``--latent_model_path``.
+
+See ``scripts/autoencoder/bart_base_roc.sh`` for an example invocation.
+"""
+
 import os
-os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 import json
-
-import sys
-
-from utils import file_utils
-from latent_models.latent_finetuning import Trainer
 import argparse
+
+from latent_models.latent_finetuning import Trainer
+
 
 def main(args):
     trainer = Trainer(
@@ -33,14 +40,10 @@ def main(args):
         trainer.load(args.resume_dir, resume_training=args.resume_training)
 
     if args.eval:
-        trainer.validation(file_path="saved_latent_models/SELFormer-selfies/2024-04-18_16-36-51/model.pt")
+        trainer.validation(file_path=args.resume_dir)
         return
-    
-    # trainer.validation(file_path="saved_latent_models/SELFormer-selfies/2024-03-20_01-30-02")
-    # trainer.save_embeddings("saved_latent_models/SELFormer-selfies/2024-04-18_16-36-51")
-    trainer.train()
 
-    
+    trainer.train()
     return
 
 if __name__ == "__main__":
@@ -50,9 +53,9 @@ if __name__ == "__main__":
     parser.add_argument("--enc_dec_model", type=str, default="zjunlp/MolGen-large")
     parser.add_argument("--train_batch_size", type=int, default=1)
     parser.add_argument("--eval_batch_size", type=int, default=32)
-    parser.add_argument("--num_encoder_latents", type=int, default=32) #16 
-    parser.add_argument("--num_decoder_latents", type=int, default=32) #16
-    parser.add_argument("--dim_ae", type=int, default=64)#8
+    parser.add_argument("--num_encoder_latents", type=int, default=32)
+    parser.add_argument("--num_decoder_latents", type=int, default=32)
+    parser.add_argument("--dim_ae", type=int, default=64)
     parser.add_argument("--num_layers", type=int, default=3)
     parser.add_argument("--l2_normalize_latents", action="store_true")
     parser.add_argument("--output_dir", type=str, default=None)
@@ -78,6 +81,7 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument("--wandb_name", type=str, default=f'bart-roc-l2norm-test-16-8')
+    parser.add_argument("--wandb_entity", type=str, default=None, help="W&B entity/team. Defaults to your default wandb account.")
     parser.add_argument(
         "--lm_mode",
         type=str,
@@ -90,20 +94,19 @@ if __name__ == "__main__":
     parser.add_argument("--eval", action="store_true")
     parser.add_argument("--resume_training", action="store_true", default=False)
     parser.add_argument("--resume_dir", type=str, default=None)
-    parser.add_argument("--ref_path", type=str, required=True, help="Path to the reference data")
-    parser.add_argument("--gen_path", type=str, required=True, help="Path to the generated data")
 
     args = parser.parse_args()
 
+    # When resuming or evaluating, restore the model config from the saved run, but keep the
+    # run-specific args (where to log / load from) from the current command line.
     if args.eval or args.resume_training:
         with open(os.path.join(args.resume_dir, 'args.json'), 'rt') as f:
             saved_args = json.load(f)
         args_dict = vars(args)
         heldout_params = {'wandb_name', 'output_dir', 'resume_dir', 'eval'}
-        for k,v in saved_args.items():
+        for k, v in saved_args.items():
             if k in heldout_params:
                 continue
             args_dict[k] = v
-    
 
     main(args)

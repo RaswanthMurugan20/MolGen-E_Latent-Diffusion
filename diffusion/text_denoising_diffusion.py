@@ -50,7 +50,6 @@ from latent_models.t5_latent_model import T5ForConditionalGenerationLatent
 from latent_models.my_latent_model import Compression_Net, Reconstruction_Net
 import diffusion.constant as constant
 import diffusion.optimizer as optimizer
-import dataset_utils.text_dataset as text_dataset
 from dataset_utils.chem_dataset import Phenotype, Phenotype_CLIP, MultiObjective, DPO
 from utils.torch_utils import compute_grad_norm
 import utils.file_utils as file_utils
@@ -822,9 +821,9 @@ class Trainer(object):
             results_folder = args.output_dir
             run = os.path.split(__file__)[-1].split(".")[0]
             if args.wandb_name:
-                self.accelerator.init_trackers(run, config=args, init_kwargs={"wandb": {"dir": results_folder, "name": args.wandb_name, "entity": "raswanth"}})
+                self.accelerator.init_trackers(run, config=args, init_kwargs={"wandb": {"dir": results_folder, "name": args.wandb_name, "entity": args.wandb_entity}})
             else:
-                self.accelerator.init_trackers(run, config=args, init_kwargs={"wandb": {"dir": results_folder, "entity": "raswanth"}})
+                self.accelerator.init_trackers(run, config=args, init_kwargs={"wandb": {"dir": results_folder, "entity": args.wandb_entity}})
 
         self.diffusion = diffusion
         self.decoding_loss = decoding_loss
@@ -885,7 +884,7 @@ class Trainer(object):
             config = self.bart_model.config
             self.cnet = Compression_Net(dim = config.d_model, depth = 3,dim_head = 64,heads = 8, num_latents = 32, num_media_embeds = 4,ff_mult = 4,compress_dim = 64).to(device)
             self.rnet = Reconstruction_Net(dim = 64,depth = 3,dim_head = 64,heads = 8,num_latents = 32, num_media_embeds = 4,ff_mult = 4,reconstruct_dim = config.d_model).to(device)
-            state_dict = torch.load("saved_latent_models/SELFormer-selfies/2024-07-16_01-53-07/model.pth",map_location=device)
+            state_dict = torch.load(os.path.join(args.latent_model_path, "model.pth"), map_location=device)
             self.cnet.load_state_dict(state_dict['compression_state_dict'], strict=True)
             self.rnet.load_state_dict(state_dict['reconstruction_state_dict'], strict=True)
 
@@ -929,24 +928,28 @@ class Trainer(object):
         self.step = 0
         
         if self.task == "phenotype_clip" or self.task == "phenotype":
+            # NOTE: the gene-expression / single-cell datasets are not bundled with this
+            # repo. Provide them via the --gene_* CLI args (see train_text_diffusion.py).
             if self.task == "phenotype_clip":
+                assert args.gene_clip_path is not None, "phenotype_clip requires --gene_clip_path (gene CLIP embeddings, not bundled)"
                 data = Phenotype_CLIP(
-                        train_path = "/raid/home/rohlan/clipDRUG/experiments/selfies_vae/mcf7_SC/logs/molgene_supcon_proj/gene_embeds_2k48.pt",
-                        val_path = "/raid/home/rohlan/clipDRUG/experiments/selfies_vae/mcf7_SC/logs/molgene_supcon_proj/gene_embeds_2k48.pt",
-                        test_path = "/raid/home/rohlan/clipDRUG/experiments/selfies_vae/mcf7_SC/logs/molgene_supcon_proj/gene_embeds_2k48.pt"
+                        train_path = args.gene_clip_path,
+                        val_path = args.gene_clip_path,
+                        test_path = args.gene_clip_path,
                         )
             else:
+                assert args.gene_train_path is not None, "phenotype requires --gene_train_path / --gene_val_path / --gene_test_path (single-cell data, not bundled)"
                 data = Phenotype(
-                        train_path = ["/raid/home/rohlan/clipDRUG/data/mcf7_SC/mcf7_SC_data_train.csv","/raid/home/rohlan/clipDRUG/data/mcf7_SC/mcf7_SC_data_val.csv","/raid/home/rohlan/clipDRUG/data/mcf7_SC/mcf7_SC_data_train.csv"],
-                        val_path = "/raid/home/rohlan/clipDRUG/data/mcf7_SC/scPerturb_samples_mcf7_SC.pt",
-                        test_path = "/raid/home/rohlan/clipDRUG/data/mcf7_SC/scPerturb_samples_mcf7_SC.pt")
+                        train_path = args.gene_train_path,
+                        val_path = args.gene_val_path,
+                        test_path = args.gene_test_path)
             self.dataloader, self.val_dataloader, self.test_dataloader, self.dataset = data.gene_dataset(train_batch_sze = train_batch_size, val_batch_sze = eval_batch_size,test_batch_sze = eval_batch_size)
             if self.fingerprint == "morgan":
                 self.true_novelty_data = [AllChem.GetMorganFingerprintAsBitVect(Chem.MolFromSmiles(sf.decoder(s["selfies"])), 3, 2048) for s in self.dataset["train"] if Chem.MolFromSmiles(sf.decoder(s["selfies"])) is not None]
             else:
                 self.true_novelty_data = [MACCSkeys.GenMACCSKeys(Chem.MolFromSmiles(sf.decoder(s["selfies"]))) for s in self.dataset["train"] if Chem.MolFromSmiles(sf.decoder(s["selfies"])) is not None]
         elif self.task == "multi-objective":
-            data = MultiObjective(dataset_path = 'datasets')
+            data = MultiObjective(dataset_path = 'datasets/Multi-Obj-Dataset')
             self.dataloader, self.val_dataloader, self.test_dataloader, self.dataset, self.valdataset = data.multiobj_dataset(train_batch_sze = train_batch_size, val_batch_sze = eval_batch_size,test_batch_sze = eval_batch_size, task = "diffusion training")
             if self.fingerprint == "morgan":
                 self.true_novelty_data = [AllChem.GetMorganFingerprintAsBitVect(Chem.MolFromSmiles(sf.decoder(s["selfies"])), 3, 2048) for s in self.dataset["train"] if Chem.MolFromSmiles(sf.decoder(s["selfies"])) is not None]
@@ -1735,7 +1738,6 @@ class Trainer(object):
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
-        # self.load(file_path="saved_diff_models/SELFormer-selfies/2024-09-25_07-07-16")
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
             while self.step < self.train_num_steps:
                 #TODO center and normalize BART latent space with empirical est. of mean/var.
@@ -1923,7 +1925,8 @@ class Trainer(object):
         
         dpo_dataset = datasets.Dataset.from_dict({"selfies":dpo_dataset})
         dpo_dataset = dpo_dataset.with_transform(diffusion_tokenize)
-        self.load(file_path="saved_diff_models/SELFormer-selfies/2024-07-21_16-00-57")
+        # Load the trained diffusion model (passed via --resume_dir) to generate candidate molecules.
+        self.load(file_path=self.args.resume_dir)
         dpo_dataset = self.multiobj_dpo_data(dpo_dataset, using_vec_cond = True, num_samples_per_multiobj=num_samples_per_multiobj)
 
         with open(dpo_file_path,'w') as f:
@@ -1934,10 +1937,14 @@ class Trainer(object):
     def dpo_train(self, beta):
         accelerator = self.accelerator
         device = accelerator.device
-        if not os.path.exists('datasets/dpo_train_data.txt') and not os.path.exists('datasets/dpo_train_data.txt'):
-            self.DPO_dataset('datasets/dpo_train_data.txt',5)
-            self.DPO_dataset('datasets/dpo_test_data.txt',5)
-        data = torch.load("saved_diff_models/SELFormer-selfies/2024-09-12_19-18-44/model.pt", map_location=device)
+        # Generate the preference (winner/loser) pairs only if they aren't already bundled.
+        dpo_train_path = 'datasets/Multi-Obj-Dataset/dpo_train_data.txt'
+        dpo_test_path = 'datasets/Multi-Obj-Dataset/dpo_test_data.txt'
+        if not os.path.exists(dpo_train_path) and not os.path.exists(dpo_test_path):
+            self.DPO_dataset(dpo_train_path, 5)
+            self.DPO_dataset(dpo_test_path, 5)
+        # Initialise the DPO reference model from the trained diffusion checkpoint (--resume_dir).
+        data = torch.load(os.path.join(self.args.resume_dir, "model.pt"), map_location=device)
         self.ema.load_state_dict(data['ema'])
         for param in self.ema.ema_model.parameters():
             param.requires_grad = False

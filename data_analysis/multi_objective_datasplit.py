@@ -18,11 +18,17 @@ def write_smiles(smiles, file_path):
                 except Exception as e:
                     pass 
 
-# Read the SMILES strings from the four files
-# file0_smiles = read_smiles('/raid/home/raswanth/multiobj-rationale/data/chembl/all.txt')
-file1_smiles = read_smiles('/raid/home/raswanth/multiobj-rationale/data/dual_gsk3_jnk3/actives.txt')
-file2_smiles = read_smiles('/raid/home/raswanth/multiobj-rationale/data/dual_gsk3_jnk3/actives.txt')
-file3_smiles = read_smiles('/raid/home/raswanth/multiobj-rationale/data/dual_gsk3_jnk3/actives.txt')
+# Read the SMILES strings from the source files. Point these at your own
+# actives/inactives lists (one molecule per line; first comma-separated field used).
+import argparse
+_parser = argparse.ArgumentParser(description="Build train/val/test (and DPO) SELFIES splits from SMILES source files")
+_parser.add_argument("--actives_path", default="datasets/Multi-Obj-Dataset/train_positive_data.txt",
+                     help="SMILES/SELFIES source file used to build the splits.")
+_args, _ = _parser.parse_known_args()
+
+file1_smiles = read_smiles(_args.actives_path)
+file2_smiles = read_smiles(_args.actives_path)
+file3_smiles = read_smiles(_args.actives_path)
 
 # print("file1",len(file1_smiles))
 print("file2",len(file1_smiles))

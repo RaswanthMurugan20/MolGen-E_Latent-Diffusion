@@ -1,0 +1,35 @@
+# Core deep learning
+torch
+transformers
+accelerate
+ema-pytorch
+einops
+
+# Datasets / experiment tracking
+datasets
+wandb
+
+# Cheminformatics
+rdkit
+selfies
+PyTDC            # provides `tdc` (QED / SA / GSK3B / JNK3 oracles)
+
+# Data / metrics / plotting
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+seaborn
+
+# Text-generation evaluation (optional; used by evaluation/evaluation.py)
+evaluate
+sentence-transformers
+nltk
+spacy
+
+# Misc
+Pillow
+tqdm
+
+# A full, pinned conda environment is also provided in environment.yml.

@@ -56,7 +56,13 @@ sa_score = []
 qed_score = []
 i,j = 0,0
 
-with open('/raid/home/raswanth/multiobj-rationale/data/chembl/actives.txt','r') as f:
+import argparse
+_parser = argparse.ArgumentParser(description="Exploratory scoring / distribution plots over a molecule dataset")
+_parser.add_argument("--data_path", default="datasets/Multi-Obj-Dataset/train_positive_data.txt",
+                     help="File with one molecule per line; the first comma-separated field is used.")
+_args, _ = _parser.parse_known_args()
+
+with open(_args.data_path, 'r') as f:
     for mol in f:
         i += 1
         smiles = mol.strip().split(',')[0]
