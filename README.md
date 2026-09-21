@@ -1,6 +1,6 @@
 # Latent Diffusion Prior for MolGene-E
 
-> **Work in progress.** A version of this work is under scientific review.
+> **Work in progress.** A version of this work is under scientific review in Briefings in Bioinformatics.
 
 Related publication:
 
